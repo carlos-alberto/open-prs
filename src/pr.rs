@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use ratatui::style::{Color, Style};
@@ -62,14 +62,17 @@ pub enum Note {
     Draft,
     /// It can't merge into its base branch
     Conflict,
+    /// It is stacked on this open PR, so that one merges first
+    On(u64),
 }
 
 impl Note {
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            Note::ForYou => "for you",
-            Note::Draft => "draft",
-            Note::Conflict => "conflict",
+            Note::ForYou => "for you".into(),
+            Note::Draft => "draft".into(),
+            Note::Conflict => "conflict".into(),
+            Note::On(number) => format!("on #{number}"),
         }
     }
 
@@ -78,6 +81,7 @@ impl Note {
             Note::ForYou => Style::new().magenta().bold(),
             Note::Draft => Style::new().dim(),
             Note::Conflict => Style::new().red(),
+            Note::On(_) => Style::new().cyan(),
         }
     }
 }
@@ -125,6 +129,15 @@ pub struct Pr {
     pub requested: bool,
     pub draft: bool,
     pub conflict: bool,
+    /// The branch it merges into
+    pub base: String,
+    /// Its branch, or empty when that is in another repo, as then nothing here can stack on it
+    pub head: String,
+    /// The open PR it is stacked on; `pick` sets it
+    pub parent: Option<u64>,
+    /// The lines that join it to its parent in the table, when the parent shows; `pick`
+    /// sets it
+    pub tree: String,
 }
 
 impl Pr {
@@ -148,7 +161,14 @@ impl Pr {
         ]
         .into_iter()
         .filter_map(|(on, note)| on.then_some(note))
+        .chain(self.parent.map(Note::On))
         .collect()
+    }
+
+    /// The repo's web page: the PR's URL without `/pull/N` or `/pulls/N`. It tells repos
+    /// apart across hosts, which `repo` can't.
+    pub fn repo_url(&self) -> &str {
+        self.url.rsplitn(3, '/').nth(2).unwrap_or(&self.url)
     }
 }
 
@@ -223,24 +243,105 @@ pub fn shared_owner<'a>(prs: impl IntoIterator<Item = &'a Pr>) -> Option<String>
 }
 
 /// The PRs to show, in the order to show them. When two sources find the same PR, the
-/// first one's copy stays.
+/// first one's copy stays. Grouped by repo, a stacked PR comes after the PR it is stacked
+/// on, with lines in `tree` that join them.
 pub fn pick<'a>(prs: impl IntoIterator<Item = &'a Pr>, filter: &Filter, group: Group) -> Vec<Pr> {
     let mut seen = HashSet::new();
-    let mut prs: Vec<Pr> = prs
+    let all: Vec<&Pr> = prs
+        .into_iter()
+        .filter(|p| seen.insert(p.url.as_str()))
+        .collect();
+    // A PR is stacked on the open PR whose branch is its base. The filter can hide that
+    // PR, so this looks at all of them
+    let heads: HashMap<(&str, &str), u64> = all
+        .iter()
+        .filter(|p| !p.head.is_empty())
+        .map(|p| ((p.repo_url(), p.head.as_str()), p.number))
+        .collect();
+    let mut prs: Vec<Pr> = all
         .into_iter()
         .filter(|p| filter.matches(p))
-        .filter(|p| seen.insert(p.url.as_str()))
-        .cloned()
+        .map(|p| Pr {
+            parent: heads
+                .get(&(p.repo_url(), p.base.as_str()))
+                .copied()
+                .filter(|n| *n != p.number),
+            tree: String::new(),
+            ..p.clone()
+        })
         .collect();
     match group {
         Group::Repo => {
-            prs.sort_by(|a, b| (&a.repo, &a.host, a.number).cmp(&(&b.repo, &b.host, b.number)))
+            prs.sort_by(|a, b| (&a.repo, &a.host, a.number).cmp(&(&b.repo, &b.host, b.number)));
+            stack(prs)
         }
-        Group::User => prs.sort_by(|a, b| {
-            (&a.author, &a.repo, &a.host, a.number).cmp(&(&b.author, &b.repo, &b.host, b.number))
-        }),
+        Group::User => {
+            prs.sort_by(|a, b| {
+                (&a.author, &a.repo, &a.host, a.number)
+                    .cmp(&(&b.author, &b.repo, &b.host, b.number))
+            });
+            prs
+        }
     }
-    prs
+}
+
+/// Puts each PR after the one it is stacked on, when that one shows in the same group, and
+/// draws the tree. The order is otherwise the same.
+fn stack(prs: Vec<Pr>) -> Vec<Pr> {
+    let index: HashMap<(&str, &str, u64), usize> = prs
+        .iter()
+        .enumerate()
+        .map(|(i, p)| ((p.repo.as_str(), p.host.as_str(), p.number), i))
+        .collect();
+    let mut children = vec![Vec::new(); prs.len()];
+    let mut joined = vec![false; prs.len()];
+    for (i, p) in prs.iter().enumerate() {
+        if let Some(&parent) = p
+            .parent
+            .and_then(|n| index.get(&(p.repo.as_str(), p.host.as_str(), n)))
+        {
+            children[parent].push(i);
+            joined[i] = true;
+        }
+    }
+
+    let mut order: Vec<(usize, String)> = Vec::with_capacity(prs.len());
+    let mut done = vec![false; prs.len()];
+    // A loop of PRs stacked on each other has no root, so its PRs start trees at the end
+    let roots = (0..prs.len()).filter(|&i| !joined[i]).chain(0..prs.len());
+    for root in roots {
+        if !done[root] {
+            done[root] = true;
+            order.push((root, String::new()));
+            walk(root, "", &children, &mut done, &mut order);
+        }
+    }
+
+    let mut prs: Vec<Option<Pr>> = prs.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .map(|(i, tree)| Pr {
+            tree,
+            ..prs[i].take().unwrap()
+        })
+        .collect()
+}
+
+fn walk(
+    i: usize,
+    lead: &str,
+    children: &[Vec<usize>],
+    done: &mut [bool],
+    order: &mut Vec<(usize, String)>,
+) {
+    let next: Vec<usize> = children[i].iter().copied().filter(|&c| !done[c]).collect();
+    for (k, &child) in next.iter().enumerate() {
+        let last = k + 1 == next.len();
+        done[child] = true;
+        order.push((child, format!("{lead}{}", if last { "└─ " } else { "├─ " })));
+        let lead = format!("{lead}{}", if last { "   " } else { "│  " });
+        walk(child, &lead, children, done, order);
+    }
 }
 
 pub fn age(t: DateTime<Utc>, now: DateTime<Utc>) -> String {
@@ -264,7 +365,7 @@ pub mod tests {
         } else {
             format!("acme/{repo}")
         };
-        let url = format!("https://{host}.example.com/{repo}/{number}");
+        let url = format!("https://{host}.example.com/{repo}/pull/{number}");
         Pr {
             host: host.into(),
             checks_url: format!("{url}/checks"),
@@ -280,7 +381,25 @@ pub mod tests {
             requested: false,
             draft: false,
             conflict: false,
+            base: "main".into(),
+            head: format!("branch-{number}"),
+            parent: None,
+            tree: String::new(),
         }
+    }
+
+    /// The same PR, stacked on `parent`'s branch.
+    pub fn on(mut p: Pr, parent: u64) -> Pr {
+        p.base = format!("branch-{parent}");
+        p
+    }
+
+    /// Each PR's number and tree, in order.
+    fn trees(prs: &[Pr], filter: &Filter) -> Vec<(u64, String)> {
+        pick(prs, filter, Group::Repo)
+            .into_iter()
+            .map(|p| (p.number, p.tree))
+            .collect()
     }
 
     fn numbers(prs: &[Pr], filter: &Filter) -> Vec<u64> {
@@ -413,12 +532,112 @@ pub mod tests {
     }
 
     #[test]
+    fn stacks_show_as_trees_under_the_pr_they_are_on() {
+        let pr = |n| pr("GitHub", "a", n, "x", Status::Needs);
+        // 1 ← 2 ← 4, 1 ← 3, and 5 on its own; 6 is in another repo, on a branch of the same name
+        let mut other = on(pr(6), 1);
+        other.repo = "acme/b".into();
+        other.url = "https://GitHub.example.com/acme/b/pull/6".into();
+        let prs = [
+            on(pr(4), 2),
+            pr(5),
+            on(pr(3), 1),
+            on(pr(2), 1),
+            pr(1),
+            other,
+        ];
+        let got = trees(&prs, &Filter::default());
+        let want = [
+            (1, ""),
+            (2, "├─ "),
+            (4, "│  └─ "),
+            (3, "└─ "),
+            (5, ""),
+            (6, ""),
+        ];
+        assert_eq!(got, want.map(|(n, t)| (n, t.to_owned())));
+        let picked = pick(&prs, &Filter::default(), Group::Repo);
+        let parents: Vec<_> = picked.iter().map(|p| (p.number, p.parent)).collect();
+        assert_eq!(
+            parents,
+            [
+                (1, None),
+                (2, Some(1)),
+                (4, Some(2)),
+                (3, Some(1)),
+                (5, None),
+                (6, None)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hidden_parent_leaves_its_stack_as_a_note() {
+        let mut prs = [1, 2, 3].map(|n| pr("GitHub", "a", n, "x", Status::Needs));
+        prs[1] = on(prs[1].clone(), 1);
+        prs[2] = on(prs[2].clone(), 2);
+        prs[0].draft = true;
+        let no_drafts = Filter {
+            hide_drafts: true,
+            ..Filter::default()
+        };
+        assert_eq!(
+            trees(&prs, &no_drafts),
+            [(2, String::new()), (3, "└─ ".to_owned())]
+        );
+        let picked = pick(&prs, &no_drafts, Group::Repo);
+        assert_eq!(picked[0].notes(), [Note::On(1)]);
+        // Grouped by user there are no trees, so every stacked PR has the note
+        let by_user = pick(&prs, &Filter::default(), Group::User);
+        let notes: Vec<_> = by_user
+            .iter()
+            .map(|p| (p.tree.clone(), p.notes()))
+            .collect();
+        assert_eq!(
+            notes,
+            [
+                (String::new(), vec![Note::Draft]),
+                (String::new(), vec![Note::On(1)]),
+                (String::new(), vec![Note::On(2)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_loop_of_stacks_still_shows_every_pr() {
+        let prs = [
+            on(pr("GitHub", "a", 1, "x", Status::Needs), 2),
+            on(pr("GitHub", "a", 2, "x", Status::Needs), 1),
+            pr("GitHub", "a", 3, "x", Status::Needs),
+        ];
+        let got = trees(&prs, &Filter::default());
+        assert_eq!(
+            got,
+            [(3, ""), (1, ""), (2, "└─ ")].map(|(n, t)| (n, t.to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_pr_from_another_repo_has_nothing_stacked_on_it() {
+        let mut fork = pr("GitHub", "a", 1, "x", Status::Needs);
+        fork.head = String::new();
+        let prs = [fork, on(pr("GitHub", "a", 2, "x", Status::Needs), 1)];
+        let parents: Vec<_> = pick(&prs, &Filter::default(), Group::Repo)
+            .into_iter()
+            .map(|p| p.parent)
+            .collect();
+        assert_eq!(parents, [None, None]);
+    }
+
+    #[test]
     fn notes_list_what_is_true_in_order() {
         let mut p = pr("GitHub", "a", 1, "x", Status::Needs);
         assert!(p.notes().is_empty());
         p.conflict = true;
         p.requested = true;
-        assert_eq!(p.notes(), [Note::ForYou, Note::Conflict]);
+        p.parent = Some(7);
+        assert_eq!(p.notes(), [Note::ForYou, Note::Conflict, Note::On(7)]);
+        assert_eq!(Note::On(7).label(), "on #7");
     }
 
     #[test]

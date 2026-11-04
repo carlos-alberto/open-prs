@@ -59,9 +59,10 @@ query($q: String!, $endCursor: String) {
   search(query: $q, type: ISSUE, first: 50, after: $endCursor) {
     pageInfo { hasNextPage endCursor }
     nodes { ... on PullRequest {
-      number title url reviewDecision updatedAt isDraft mergeable
+      number title url reviewDecision updatedAt isDraft mergeable baseRefName headRefName
       author { login }
       repository { nameWithOwner }
+      headRepository { nameWithOwner }
       latestOpinionatedReviews(first: 20) { nodes { state } }
       commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
     } }
@@ -119,8 +120,12 @@ struct GhPr {
     is_draft: bool,
     /// MERGEABLE, CONFLICTING, or UNKNOWN while GitHub works it out
     mergeable: String,
+    base_ref_name: String,
+    head_ref_name: String,
     author: Option<GhLogin>,
     repository: GhRepo,
+    /// null when the fork it came from is gone
+    head_repository: Option<GhRepo>,
     latest_opinionated_reviews: GhReviews,
     commits: GhCommits,
 }
@@ -144,6 +149,7 @@ struct GhCommit {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(PartialEq)]
 struct GhRepo {
     name_with_owner: String,
 }
@@ -219,6 +225,12 @@ fn parse_github(name: &str, out: &str) -> Result<Vec<Pr>> {
                     .map(String::from)
             });
             let author = n.author.map_or_else(|| "ghost".into(), |a| a.login);
+            // A branch in a fork can have the name of one here, so nothing stacks on it
+            let head = if n.head_repository.as_ref() == Some(&n.repository) {
+                n.head_ref_name
+            } else {
+                String::new()
+            };
             let rollup = n
                 .commits
                 .nodes
@@ -244,6 +256,10 @@ fn parse_github(name: &str, out: &str) -> Result<Vec<Pr>> {
                 requested: false,
                 draft: n.is_draft,
                 conflict: n.mergeable == "CONFLICTING",
+                base: n.base_ref_name,
+                head,
+                parent: None,
+                tree: String::new(),
             });
         }
     }
@@ -297,12 +313,18 @@ struct TeaPull {
     mergeable: Option<bool>,
 }
 
+/// A PR in a repo's list, which has what the issue search and the PR on its own don't.
 #[derive(Deserialize)]
-struct TeaPullCi {
+struct TeaRepoPull {
     index: String,
     /// The combined commit status, or empty without one
     #[serde(default)]
     ci: String,
+    #[serde(default)]
+    base: String,
+    /// Its branch; the PR on its own gives refs/pull/N/head in its place
+    #[serde(default)]
+    head: String,
 }
 
 #[derive(Deserialize)]
@@ -375,61 +397,85 @@ fn forgejo(name: &str, login: &str, owner: Option<&str>) -> Result<Vec<Pr>> {
             requested: forgejo_requested(&reviews, &me),
             draft,
             conflict: pull.mergeable == Some(false) && !draft,
+            base: String::new(),
+            head: String::new(),
+            parent: None,
+            tree: String::new(),
         })
     };
 
-    // One tea call per PR for its reviews and one per repo for CI, all side by side
+    // One tea call per PR for its reviews, and one per repo for CI and branches, all side by side
     let repos: Vec<String> = listed
         .iter()
         .map(|pr| format!("{}/{}", pr.owner, pr.repo))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let (ci, prs) = thread::scope(|s| {
-        let ci = s.spawn(|| par_map(&repos, 4, |repo| forgejo_ci(login, repo)));
+    let (by_repo, prs) = thread::scope(|s| {
+        let by_repo = s.spawn(|| par_map(&repos, 4, |repo| forgejo_repo_pulls(login, repo)));
         let prs = par_map(&listed, 8, status);
-        (ci.join().unwrap(), prs)
+        (by_repo.join().unwrap(), prs)
     });
-    let ci: HashMap<&str, HashMap<String, Option<Ci>>> = repos
+    let by_repo: HashMap<&str, HashMap<String, TeaRepoPull>> = repos
         .iter()
         .map(String::as_str)
-        .zip(ci.into_iter().collect::<Result<Vec<_>>>()?)
+        .zip(by_repo.into_iter().collect::<Result<Vec<_>>>()?)
         .collect();
     let mut prs = prs.into_iter().collect::<Result<Vec<_>>>()?;
     for pr in &mut prs {
-        pr.ci = ci
+        let Some(listed) = by_repo
             .get(pr.repo.as_str())
-            .and_then(|by_number| by_number.get(&pr.number.to_string()))
-            .copied()
-            .flatten();
+            .and_then(|pulls| pulls.get(&pr.number.to_string()))
+        else {
+            continue;
+        };
+        pr.ci = forgejo_ci_state(&listed.ci);
+        pr.base = listed.base.clone();
+        pr.head = forgejo_head(&listed.head);
     }
     Ok(prs)
 }
 
-/// The CI state of each open PR in `repo`, by number. tea gives it in a repo's list of PRs,
-/// so this is one call per repo, not per PR.
-fn forgejo_ci(login: &str, repo: &str) -> Result<HashMap<String, Option<Ci>>> {
-    let mut ci = HashMap::new();
+/// The open PRs in `repo`, by number. tea gives CI and branches only in a repo's list of
+/// PRs, so this is one call per repo, not per PR.
+fn forgejo_repo_pulls(login: &str, repo: &str) -> Result<HashMap<String, TeaRepoPull>> {
+    let mut pulls = HashMap::new();
     for page in 1.. {
         let page = page.to_string();
-        let batch: Vec<TeaPullCi> = tea(
+        let batch: Vec<TeaRepoPull> = tea(
             login,
             &[
-                "pulls", "list", "--repo", repo, "--state", "open", "--limit", "50", "--page",
-                &page, "--fields", "index,ci",
+                "pulls",
+                "list",
+                "--repo",
+                repo,
+                "--state",
+                "open",
+                "--limit",
+                "50",
+                "--page",
+                &page,
+                "--fields",
+                "index,ci,base,head",
             ],
         )?;
         let last = batch.len() < 50;
-        ci.extend(
-            batch
-                .into_iter()
-                .map(|p| (p.index, forgejo_ci_state(&p.ci))),
-        );
+        pulls.extend(batch.into_iter().map(|p| (p.index.clone(), p)));
         if last {
             break;
         }
     }
-    Ok(ci)
+    Ok(pulls)
+}
+
+/// A branch name can't have a colon in it, so a head with one is owner:branch from another
+/// repo, and nothing here stacks on it.
+fn forgejo_head(head: &str) -> String {
+    if head.contains(':') {
+        String::new()
+    } else {
+        head.into()
+    }
 }
 
 fn forgejo_ci_state(state: &str) -> Option<Ci> {
@@ -578,13 +624,19 @@ mod tests {
                 2 => (true, "CONFLICTING"),
                 _ => (false, "UNKNOWN"),
             };
+            // 2 is from a fork, and 3's fork is gone
+            let head_repo = match number {
+                1 => r#"{"nameWithOwner":"acme/r"}"#,
+                2 => r#"{"nameWithOwner":"fork/r"}"#,
+                _ => "null",
+            };
             let commits = match number {
                 1 => r#"{"commit":{"statusCheckRollup":{"state":"FAILURE"}}}"#,
                 2 => r#"{"commit":{"statusCheckRollup":null}}"#,
                 _ => "",
             };
             format!(
-                r#"{{"number":{number},"title":"t","url":"u{number}","reviewDecision":{decision},"updatedAt":"2026-11-04T09:07:15Z","isDraft":{draft},"mergeable":"{mergeable}","author":{author},"repository":{{"nameWithOwner":"acme/r"}},"latestOpinionatedReviews":{{"nodes":[{reviews}]}},"commits":{{"nodes":[{commits}]}}}}"#
+                r#"{{"number":{number},"title":"t","url":"u{number}","reviewDecision":{decision},"updatedAt":"2026-11-04T09:07:15Z","isDraft":{draft},"mergeable":"{mergeable}","baseRefName":"main","headRefName":"b{number}","author":{author},"repository":{{"nameWithOwner":"acme/r"}},"headRepository":{head_repo},"latestOpinionatedReviews":{{"nodes":[{reviews}]}},"commits":{{"nodes":[{commits}]}}}}"#
             )
         };
         let out = format!(
@@ -634,6 +686,11 @@ mod tests {
             ]
         );
         assert_eq!(prs[0].checks_url, "u1/checks");
+        let branches: Vec<_> = prs
+            .iter()
+            .map(|p| (p.base.as_str(), p.head.as_str()))
+            .collect();
+        assert_eq!(branches, [("main", "b1"), ("main", ""), ("main", "")]);
         assert_eq!(
             got,
             [
@@ -679,6 +736,12 @@ mod tests {
             ],
             "me"
         ));
+    }
+
+    #[test]
+    fn a_forgejo_head_from_another_repo_is_left_out() {
+        assert_eq!(forgejo_head("feature"), "feature");
+        assert_eq!(forgejo_head("someone:feature"), "");
     }
 
     #[test]

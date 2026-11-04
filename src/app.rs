@@ -19,7 +19,7 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::config::{self, Change, Origin, Source};
 use crate::manage::{self, Form, FormAction, List, ListRow};
-use crate::pr::{Filter, Group, Pr, Status, age, pick, shared_owner};
+use crate::pr::{Filter, Group, Note, Pr, Status, age, pick, shared_owner};
 use crate::sources;
 
 const TITLE: &str = "Open PRs";
@@ -70,8 +70,9 @@ const HELP: [(&str, &str); 17] = [
     ("q, ctrl+c", "Quit"),
 ];
 
-const NOTES_HELP: &str =
-    "Notes: for you, the PR asks for your review; draft, it isn't ready; conflict, it can't merge.";
+const NOTES_HELP: &str = "Notes: for you, the PR asks for your review; draft, it isn't ready; \
+    conflict, it can't merge; on #N, it is stacked on PR N, which merges first. Grouped by repo, \
+    a stacked PR shows under the PR it is on.";
 
 enum Msg {
     Input(io::Result<Event>),
@@ -763,9 +764,11 @@ impl App {
             let ci = p.ci.map_or_else(Line::default, |ci| {
                 Line::styled(ci.label(), Style::new().fg(ci.color()))
             });
+            // The tree shows what the PR is stacked on, when it can
             let notes = Line::from(
                 p.notes()
                     .into_iter()
+                    .filter(|note| !matches!(note, Note::On(_)) || p.tree.is_empty())
                     .enumerate()
                     .flat_map(|(i, note)| {
                         let gap = Span::raw(if i == 0 { "" } else { " " });
@@ -775,7 +778,10 @@ impl App {
             );
             if by_repo {
                 row.extend([
-                    Line::raw(format!("#{}", p.number)),
+                    Line::from(vec![
+                        Span::styled(p.tree.clone(), Style::new().dim()),
+                        Span::raw(format!("#{}", p.number)),
+                    ]),
                     status,
                     ci,
                     notes,
@@ -1285,6 +1291,48 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("Only PRs with failing CI")));
         app.on_key(key(KeyCode::Char('x')));
         assert!(matches!(app.mode, Mode::Table));
+    }
+
+    #[test]
+    fn a_stack_shows_as_a_tree_by_repo_and_as_notes_by_user() {
+        use crate::pr::tests::on;
+        let (mut app, _rx) = app(Group::Repo, vec![github()]);
+        let pr = |n, author| pr("GitHub", "app", n, author, Status::Needs);
+        app.feeds[0].prs = vec![
+            pr(1, "amy"),
+            on(pr(2, "amy"), 1),
+            on(pr(3, "zed"), 2),
+            on(pr(4, "amy"), 1),
+        ];
+        app.show();
+        let lines = screen(&mut app, 110, 8);
+        // Repo is 4 wide and Host 6, with 2 between columns, so # starts at character 14
+        let numbers: Vec<String> = lines[2..6]
+            .iter()
+            .map(|l| {
+                l.chars()
+                    .skip(14)
+                    .take(8)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(numbers, ["#1", "├─ #2", "│  └─ #3", "└─ #4"]);
+        assert!(!lines[2..6].iter().any(|l| l.contains("on #")));
+
+        app.on_key(key(KeyCode::Char('g')));
+        let lines = screen(&mut app, 110, 8);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("app#2") && l.contains("on #1"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("app#3") && l.contains("on #2"))
+        );
     }
 
     #[test]

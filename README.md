@@ -35,7 +35,22 @@ The footer shows as many keys as fit, and `?` shows them all.
 The CI column is `passed`, `failing` or `pending`, and blank when the last commit has no
 checks. The Notes column says when a PR asks for your review (`for you`, which on GitHub
 includes requests to your teams), is a `draft`, or has a `conflict` with its base branch.
-Drafts are dim. On Forgejo, `c` opens the repo's list of action runs, as there is no
+Drafts are dim.
+
+A PR whose base is another open PR's branch is stacked on it, and that PR merges first.
+Grouped by repo, a stacked PR shows under the PR it is on, joined to it by lines:
+
+```
+api        GitHub  #412          approved
+                   └─ #418       approved
+                      └─ #421    needs review
+web        GitHub  #2            approved
+                   ├─ #3         changes requested
+                   └─ #4         approved
+```
+
+When the tree can't show it, because the PRs are grouped by user or a filter hides the PR
+it is on, the Notes column says `on #N`. A branch from a fork can't have PRs stacked on it. On Forgejo, `c` opens the repo's list of action runs, as there is no
 checks page per PR.
 
 When stdout isn't a terminal, it prints one tab-separated line per PR instead:
