@@ -34,7 +34,7 @@ pub fn preview(source: &Source, pr: &Pr) -> Result<Preview> {
 /// source's PRs, for Forgejo, which tea can't ask who can review.
 pub fn reviewers(source: &Source, pr: &Pr, known: &[String]) -> Result<Reviewers> {
     match &source.kind {
-        Kind::GitHub { hostname, .. } => github_reviewers(&pr.url, hostname.as_deref()),
+        Kind::GitHub { hostname, .. } => github_reviewers(pr, hostname.as_deref()),
         Kind::Forgejo { login, .. } => forgejo_reviewers(login, pr, known),
     }
 }
@@ -604,18 +604,48 @@ struct GhAssignable {
     assignable_users: GhNodes<GhLogin>,
 }
 
-fn github_reviewers(url: &str, hostname: Option<&str>) -> Result<Reviewers> {
-    let query = format!("query={GITHUB_REVIEWERS_QUERY}");
-    let url_field = format!("url={url}");
-    let mut cmd = vec!["gh", "api"];
-    if let Some(hostname) = hostname {
-        cmd.extend(["--hostname", hostname]);
-    }
-    cmd.extend(["graphql", "-f", &query, "-f", &url_field]);
-    parse_github_reviewers(&run(&cmd)?)
+#[derive(Deserialize)]
+struct GhTeam {
+    slug: String,
 }
 
-fn parse_github_reviewers(out: &str) -> Result<Reviewers> {
+fn github_reviewers(pr: &Pr, hostname: Option<&str>) -> Result<Reviewers> {
+    let gh = |args: &[&str]| {
+        let mut cmd = vec!["gh", "api"];
+        if let Some(hostname) = hostname {
+            cmd.extend(["--hostname", hostname]);
+        }
+        cmd.extend(args);
+        run(&cmd)
+    };
+    let query = format!("query={GITHUB_REVIEWERS_QUERY}");
+    let url_field = format!("url={}", pr.url);
+    let teams_endpoint = format!("repos/{}/teams", pr.repo);
+    let (out, teams) = thread::scope(|s| {
+        let teams = s.spawn(|| gh(&[&teams_endpoint, "--paginate"]));
+        let out = gh(&["graphql", "-f", &query, "-f", &url_field]);
+        (out, teams.join().unwrap())
+    });
+    // The people still work without the teams, as when no one may see them
+    let teams = teams
+        .and_then(|out| github_teams(&out, pr.owner()))
+        .unwrap_or_default();
+    parse_github_reviewers(&out?, teams)
+}
+
+/// The teams with access to the repo, as owner/slug: only they can review its PRs.
+fn github_teams(out: &str, owner: &str) -> Result<Vec<String>> {
+    let mut teams = Vec::new();
+    // --paginate prints one JSON array per page
+    for page in serde_json::Deserializer::from_str(out).into_iter::<Vec<GhTeam>>() {
+        let page = page.context("could not read the teams from gh")?;
+        teams.extend(page.into_iter().map(|t| format!("{owner}/{}", t.slug)));
+    }
+    Ok(teams)
+}
+
+/// The people are GitHub's suggestions, then `teams`, then the users who can be assigned.
+fn parse_github_reviewers(out: &str, teams: Vec<String>) -> Result<Reviewers> {
     let page: GhReviewersPage =
         serde_json::from_str(out).context("could not read the reply from gh")?;
     let pr = page.data.resource.context("gh found no such PR")?;
@@ -652,6 +682,7 @@ fn parse_github_reviewers(out: &str) -> Result<Reviewers> {
         .suggested_reviewers
         .into_iter()
         .map(|s| s.reviewer.login)
+        .chain(teams)
         .chain(
             pr.repository
                 .assignable_users
@@ -1219,10 +1250,12 @@ mod tests {
           "repository":{"assignableUsers":{"nodes":[
             {"login":"amy"},{"login":"bao"},{"login":"chidi"},{"login":"erin"}]}}
         }}}"#;
-        let r = parse_github_reviewers(out).unwrap();
+        let teams = github_teams(r#"[{"slug":"api"}][{"slug":"web"}]"#, "acme").unwrap();
+        assert_eq!(teams, ["acme/api", "acme/web"]);
+        let r = parse_github_reviewers(out, teams).unwrap();
         assert_eq!(r.requested, ["bao", "acme/api"]);
-        // The suggestions first, and not the author
-        assert_eq!(r.people, ["chidi", "bao", "erin"]);
+        // The suggestions first, then the teams, and not the author
+        assert_eq!(r.people, ["chidi", "acme/api", "acme/web", "bao", "erin"]);
         assert_eq!(
             r.verdicts,
             HashMap::from([("chidi".into(), "changes requested")])

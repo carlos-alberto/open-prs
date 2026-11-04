@@ -139,15 +139,17 @@ state of them all.
 `v` shows who the PR asks for a review, with a tick, and the people who can review it. Type
 to filter the names, `space` ticks or unticks the name under the cursor, and `enter` saves.
 With nothing ticked yet, `enter` ticks the name under the cursor first, so `v`, a name and
-`enter` asks one person. A name that isn't in the list shows as typed, for someone it
-doesn't know or a GitHub team as `org/team`.
+`enter` asks one person or team. A team is `org/team`, and the words match its name after
+the `/`, so `eng` finds `acme/engineering`. A name that isn't in the list shows as typed,
+for someone it doesn't know.
 
-![The reviewers of a PR: it asks bao, and dana is ticked](docs/reviewers.svg)
+![The reviewers of a PR: it asks bao, and the acme/backend team is ticked](docs/reviewers.svg)
 
 The host tells each person it asks, so the panel says what `enter` does before you press
-it. On GitHub, the people are GitHub's suggestions, then the users who can be assigned in
-the repo. tea can't list who can review on Forgejo and Gitea, so there the people are the
-authors of the source's PRs and the PR's reviewers.
+it. On GitHub, the list has GitHub's suggestions, then the teams with access to the repo,
+then the users who can be assigned in it. tea can't list who can review on Forgejo and
+Gitea, so there the list has the authors of the source's PRs and the PR's reviewers, and no
+teams.
 
 ## Sources
 

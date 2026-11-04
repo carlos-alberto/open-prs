@@ -211,15 +211,23 @@ fn screenshots() {
     }
     save("preview", &mut app, 100, 30);
 
-    // Who api #418 asks, and dana ticked
+    // Who api #418 asks, and a team ticked
     app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     app.on_key(key('v'));
     let url = app.selected().unwrap().url.clone();
     let reviewers = Reviewers {
         requested: vec!["bao".into()],
-        people: ["chidi", "bao", "dana", "erin", "sam"]
-            .map(String::from)
-            .into(),
+        people: [
+            "chidi",
+            "acme/backend",
+            "acme/web",
+            "bao",
+            "dana",
+            "erin",
+            "sam",
+        ]
+        .map(String::from)
+        .into(),
         verdicts: [("chidi".to_owned(), "commented")].into(),
     };
     app.reviewers_loaded(url, Ok(reviewers));

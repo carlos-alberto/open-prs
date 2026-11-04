@@ -64,6 +64,16 @@ fn names(names: &[String]) -> String {
     }
 }
 
+/// Whether a person or team has the words in their name. A team, org/slug, matches on its
+/// slug, as each team has the org's name in it, or on all of it from the start.
+fn matches(name: &str, text: &str) -> bool {
+    let name = name.to_lowercase();
+    match name.split_once('/') {
+        Some((_, slug)) => slug.contains(text) || name.starts_with(text),
+        None => name.contains(text),
+    }
+}
+
 pub enum Action {
     None,
     Close,
@@ -133,7 +143,7 @@ impl Picker {
         }
         let mut rows: Vec<Row> = names
             .into_iter()
-            .filter(|n| n.to_lowercase().contains(&text))
+            .filter(|n| matches(n, &text))
             .map(|n| Row::Person(n.clone()))
             .collect();
         let typed = self.text.trim();
@@ -242,7 +252,9 @@ impl Picker {
         ];
 
         // The rows that fit, with the cursor in them
-        let room = usize::from(area.height.saturating_sub(10)).max(3);
+        // The borders, the words, two blank lines, a line for what enter does and one for
+        // the keys, and one more for when that says more
+        let room = usize::from(area.height.saturating_sub(9)).max(3);
         match &self.content {
             None => lines.push(Line::raw("Loading…").dim()),
             Some(Err(error)) => {
@@ -257,9 +269,20 @@ impl Picker {
                 if rows.is_empty() {
                     lines.push(Line::raw("No one; type a name").dim());
                 }
-                let first = self.cursor.saturating_sub(room - 1);
-                for (i, row) in rows.iter().enumerate().skip(first).take(room) {
+                // With too many, the last line says how many more there are
+                let shown = if rows.len() > room { room - 1 } else { room };
+                let first = self.cursor.saturating_sub(shown - 1);
+                for (i, row) in rows.iter().enumerate().skip(first).take(shown) {
                     lines.push(self.row(row, i == self.cursor, reviewers, inner));
+                }
+                let more = rows.len().saturating_sub(first + shown);
+                if rows.len() > room {
+                    let hidden = if more > 0 {
+                        format!("  ↓ {more} more; type to find them")
+                    } else {
+                        format!("  ↑ {first} more above")
+                    };
+                    lines.push(Line::raw(hidden).dim());
                 }
             }
         }
@@ -313,6 +336,9 @@ impl Picker {
             Span::styled(format!("{tick} "), Style::new().green().bold()),
             Span::raw(clean(name)),
         ];
+        if name.contains('/') {
+            spans.push(Span::styled("  team", Style::new().dim()));
+        }
         if typed {
             spans.push(Span::styled(" (as typed)", Style::new().dim()));
         }
@@ -381,6 +407,29 @@ mod tests {
     }
 
     #[test]
+    fn teams_match_on_their_slug() {
+        let mut picker = Picker::new(pr("GitHub", "api", 418, "amy", Status::Needs));
+        picker.loaded(Ok(Reviewers {
+            people: ["bao", "big-engine/engineering", "big-engine/product"]
+                .map(String::from)
+                .into(),
+            ..Reviewers::default()
+        }));
+        type_text(&mut picker, "eng");
+        assert_eq!(
+            picker.rows()[0],
+            Row::Person("big-engine/engineering".into())
+        );
+        assert_eq!(picker.rows().len(), 2, "and eng as typed");
+        picker.set_text("big-engine/p".into());
+        assert_eq!(picker.rows()[0], Row::Person("big-engine/product".into()));
+        let Action::Save(change) = picker.on_key(key(KeyCode::Enter)) else {
+            panic!("expected a save");
+        };
+        assert_eq!(change.add, ["big-engine/product"]);
+    }
+
+    #[test]
     fn a_name_and_enter_asks_them() {
         let mut picker = picker();
         type_text(&mut picker, "dan");
@@ -432,6 +481,37 @@ mod tests {
         assert!(matches!(picker.on_key(key(KeyCode::Enter)), Action::None));
         picker.loaded(Ok(Reviewers::default()));
         assert!(matches!(picker.on_key(key(KeyCode::Enter)), Action::None));
+    }
+
+    #[test]
+    fn the_list_says_how_many_more_names_there_are() {
+        let mut picker = Picker::new(pr("GitHub", "api", 418, "amy", Status::Needs));
+        picker.loaded(Ok(Reviewers {
+            people: (0..20).map(|i| format!("user{i}")).collect(),
+            ..Reviewers::default()
+        }));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(64, 16)).unwrap();
+        terminal.draw(|f| picker.draw(f, f.area())).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: Vec<String> = (0..16)
+            .map(|y| (0..64).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        let text = text.join("\n");
+        // 16 lines leave 7 for names: 6, and the line that says so
+        assert!(text.contains("user5 "), "{text}");
+        assert!(!text.contains("user6 "), "{text}");
+        assert!(text.contains("↓ 14 more; type to find them"), "{text}");
+
+        picker.cursor = 19;
+        terminal.draw(|f| picker.draw(f, f.area())).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..16)
+            .flat_map(|y| (0..64).map(move |x| (x, y)))
+            .map(|xy| buffer[xy].symbol().to_owned())
+            .collect();
+        assert!(text.contains("user19 "), "{text}");
+        assert!(text.contains("↑ 14 more above"), "{text}");
     }
 
     #[test]
