@@ -1064,9 +1064,12 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         })
         .collect();
     lines.push(Line::raw(""));
-    lines.push(Line::from(NOTES_HELP).dim());
+    // Inside the borders and the padding
+    let width = 100.min(area.width);
+    let notes = wrap(NOTES_HELP, width.saturating_sub(4).max(1));
+    lines.extend(notes.into_iter().map(|line| Line::from(line).dim()));
     lines.push(Line::from("Any key closes this.").dim());
-    let rect = manage::popup(area, 100, lines.len() as u16 + 2);
+    let rect = manage::popup(area, width, lines.len() as u16 + 2);
     frame.render_widget(Clear, rect);
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -1475,6 +1478,15 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("Only PRs with failing CI")));
         app.on_key(key(KeyCode::Char('x')));
         assert!(matches!(app.mode, Mode::Table));
+    }
+
+    #[test]
+    fn the_notes_in_the_help_wrap_to_its_width() {
+        let (mut app, _rx) = app(Group::Repo, vec![github()]);
+        app.on_key(key(KeyCode::Char('?')));
+        let text = screen(&mut app, 80, 40).join("\n");
+        assert!(text.contains("│ Notes: for you,"), "{text}");
+        assert!(text.contains("shows under the PR it is on."), "{text}");
     }
 
     #[test]
