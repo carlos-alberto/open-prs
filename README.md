@@ -1,5 +1,7 @@
 # open_prs
 
+[![CI](https://github.com/carlos-alberto/open-prs/actions/workflows/ci.yml/badge.svg)](https://github.com/carlos-alberto/open-prs/actions/workflows/ci.yml)
+
 A TUI that lists the open PRs on GitHub, Forgejo and Gitea, with their review status, CI
 status and comments, and shows which PRs are stacked on which.
 
@@ -179,4 +181,5 @@ cargo clippy --all-targets
 cargo test screenshots -- --ignored   # draws docs/*.svg again
 ```
 
-The screenshots are the real TUI, drawn with the made-up PRs in `src/screenshots.rs`.
+The screenshots are the real TUI, drawn with the made-up PRs in `src/screenshots.rs`. CI
+runs these on each push and PR, and fails when the screenshots don't match the code.
