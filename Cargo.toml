@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "A TUI that lists open PRs on GitHub, Forgejo and Gitea, with their review and CI status"
 repository = "https://github.com/carlos-alberto/open-prs"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = "1.0.104"
