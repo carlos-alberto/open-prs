@@ -1638,3 +1638,7 @@ mod tests {
         assert!(!app.filter.failing);
     }
 }
+
+#[cfg(test)]
+#[path = "screenshots.rs"]
+mod screenshots;

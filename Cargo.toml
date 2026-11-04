@@ -2,7 +2,8 @@
 name = "open_prs"
 version = "0.1.0"
 edition = "2024"
-description = "List open PRs on GitHub, Forgejo and Gitea with their review status, in a TUI"
+description = "A TUI that lists open PRs on GitHub, Forgejo and Gitea, with their review and CI status"
+repository = "https://github.com/carlos-alberto/open-prs"
 
 [dependencies]
 anyhow = "1.0.104"

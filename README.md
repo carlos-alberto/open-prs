@@ -1,6 +1,35 @@
 # open_prs
 
-Lists open PRs on GitHub, Forgejo and Gitea, with their review status and CI status, in a TUI.
+A TUI that lists the open PRs on GitHub, Forgejo and Gitea, with their review status, CI
+status and comments, and shows which PRs are stacked on which.
+
+![open_prs with 10 PRs from GitHub and Forgejo, grouped by repo](docs/table.svg)
+
+- One list for many GitHub searches and Forgejo or Gitea logins
+- Review status, CI, review requests for you, drafts and merge conflicts
+- Stacked PRs show as a tree under the PR they are on
+- Filters for your PRs, approved PRs, PRs that need review, review requests, failing CI and
+  drafts, and a text filter
+- `enter` opens the PR, `c` opens its CI runs and `y` copies its URL
+- Add, edit and delete sources in the TUI; changes save to the config file and keep its
+  comments
+- It reloads every minute and keeps the cursor on the same PR
+- A tab-separated list when stdout isn't a terminal, for scripts
+
+The screenshots show made-up PRs.
+
+## Install
+
+```
+cargo install --git https://github.com/carlos-alberto/open-prs
+```
+
+This puts `open_prs` in `~/.cargo/bin`. It needs:
+
+- [`gh`](https://cli.github.com), logged in, for GitHub sources
+- [`tea`](https://gitea.com/gitea/tea), with a login, for Forgejo and Gitea sources
+
+## Usage
 
 ```
 open_prs [-m/--mine] [-a/--approved | -n/--needs-review] [-w/--for-you] [-f/--failing]
@@ -8,8 +37,9 @@ open_prs [-m/--mine] [-a/--approved | -n/--needs-review] [-w/--for-you] [-f/--fa
          [--github QUERY]... [--forgejo LOGIN]...
 ```
 
-The flags set how the TUI starts. The keys `m`, `a`, `n`, `w`, `f`, `d` and `g` toggle them
-while it runs, and `/` changes the words. It reloads every SECONDS (default 60) and keeps the cursor on the same PR.
+With no sources, it shows the PRs on github.com that involve you. The flags set how the TUI
+starts. The keys `m`, `a`, `n`, `w`, `f`, `d` and `g` toggle them while it runs, and `/`
+changes the words. It reloads every SECONDS (default 60).
 
 | Key | Action |
 |-----|--------|
@@ -33,11 +63,7 @@ while it runs, and `/` changes the words. It reloads every SECONDS (default 60) 
 
 The footer shows as many keys as fit, and `?` shows them all.
 
-The Host column shows only when the PRs come from more than one host. When the title has
-less than 25 columns, the table puts one space between columns and shortens
-`changes requested` to `changes`. Nothing else hides: `→` scrolls the columns after `#` to
-the left, so the title gets their room, and `‹` shows that some are hidden. `←` brings them
-back.
+## The table
 
 The CI column is `passed`, `failing` or `pending`, and blank when the last commit has no
 checks. The Notes column says when a PR asks for your review (`for you`, which on GitHub
@@ -45,36 +71,40 @@ includes requests to your teams), is a `draft`, or has a `conflict` with its bas
 Drafts are dim.
 
 The Comments column has the number that the host shows next to the PR in its own list, and
-is blank for none. GitHub counts the comments in the conversation and the inline comments
-on the code. Forgejo counts each comment in the conversation and each review, also an
-approval with no text, but not the inline comments.
+is blank for none. GitHub counts the comments in the conversation and the inline comments on
+the code. Forgejo counts each comment in the conversation and each review, also an approval
+with no text, but not the inline comments.
+
+The Host column shows only when the PRs come from more than one host. The table leaves out
+the owner when every PR has the same one. When two sources find the same PR, it shows once,
+from the first source.
+
+On Forgejo, `c` opens the repo's list of action runs, as there is no checks page per PR.
+
+### Stacks
 
 A PR whose base is another open PR's branch is stacked on it, and that PR merges first.
-Grouped by repo, a stacked PR shows under the PR it is on, joined to it by lines:
+Grouped by repo, a stacked PR shows under the PR it is on, joined to it by lines. In the
+screenshot, api #421 is on #418, which is on #412.
 
-```
-api        GitHub  #412          approved
-                   └─ #418       approved
-                      └─ #421    needs review
-web        GitHub  #2            approved
-                   ├─ #3         changes requested
-                   └─ #4         approved
-```
+When the tree can't show it, because the PRs are grouped by user or a filter hides the PR it
+is on, the Notes column says `on #N`. A branch from a fork can't have PRs stacked on it.
 
-When the tree can't show it, because the PRs are grouped by user or a filter hides the PR
-it is on, the Notes column says `on #N`. A branch from a fork can't have PRs stacked on it. On Forgejo, `c` opens the repo's list of action runs, as there is no
-checks page per PR.
+### Narrow terminals
 
-When stdout isn't a terminal, it prints one tab-separated line per PR instead:
-host, repo, number, status, author, title, url, ci, notes, comments. The notes have
-commas between them. It exits 1 if a source failed.
+When the title has less than 25 columns, the table puts one space between the columns and
+shortens `changes requested` to `changes`. Nothing else hides: `→` scrolls the columns after
+`#` to the left, so the title gets their room, and `‹` shows that some are hidden. `←`
+brings them back.
+
+![The same PRs in 92 columns, scrolled past Host, Status and CI](docs/narrow.svg)
 
 ## Sources
 
 Each source is a GitHub search or a tea login. They come from, in order:
 
-1. `--github QUERY` and `--forgejo LOGIN`, each as many times as you like. Changes made
-   with `s` last until you quit.
+1. `--github QUERY` and `--forgejo LOGIN`, each as many times as you like. Changes made with
+   `s` last until you quit.
 2. `$XDG_CONFIG_HOME/open_prs/config.toml`, else `~/.config/open_prs/config.toml`. Changes
    made with `s` save to this file, and keep its comments.
 3. Neither: one GitHub search for `involves:@me`.
@@ -94,17 +124,28 @@ owner = "forgejo"              # only this user's or org's repos; without it, a 
 # name = "Codeberg"            # default: the login
 ```
 
-When two sources find the same PR, it shows once, from the first source. The table leaves
-out the owner when every PR has the same one.
+`s` shows each source, how many PRs it found, and the error of a source that failed:
 
-## Needs
+![The Sources panel, with a GitHub Enterprise source that failed](docs/sources.svg)
 
-- `gh`, logged in, for GitHub sources
-- `tea`, with a login, for Forgejo and Gitea sources
+## Plain output
 
-## Build
+When stdout isn't a terminal, it prints one tab-separated line per PR instead: host, repo,
+number, status, author, title, url, ci, notes, comments. The notes have commas between them.
+It exits 1 if a source failed.
 
 ```
-cargo build --release
-cargo install --path .   # puts open_prs in ~/.cargo/bin
+$ open_prs --github org:acme --failing | cut -f 1-5,8,9
+GitHub	acme/billing	88	changes requested	chidi	failing	conflict
+GitHub	acme/web	1291	needs review	sam	failing	on #1290
 ```
+
+## Development
+
+```
+cargo test
+cargo clippy --all-targets
+cargo test screenshots -- --ignored   # draws docs/*.svg again
+```
+
+The screenshots are the real TUI, drawn with the made-up PRs in `src/screenshots.rs`.
