@@ -20,6 +20,7 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::config::{self, Change, Origin, Source};
 use crate::manage::{self, Form, FormAction, List, ListRow};
+use crate::notify::{self, Notice};
 use crate::pr::{Filter, Group, Note, Pr, Status, age, pick, shared_owner};
 use crate::preview::{self, Preview};
 use crate::reviewers::{self, Picker, Reviewers};
@@ -215,6 +216,8 @@ struct Feed {
     state: State,
     /// Its next load is its first, which puts its PRs down as seen
     start: bool,
+    /// It loaded since the source last changed, so a load can say what changed
+    loaded: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -295,6 +298,8 @@ pub struct App {
     load_reviewers: fn(&Source, &Pr, &[String]) -> Result<Reviewers>,
     /// Changes who a PR asks for a review
     save_reviewers: fn(&Source, &Pr, &reviewers::Change) -> Result<()>,
+    /// Sends a desktop notification, or None not to; the tests replace it
+    notifier: Option<fn(&Notice)>,
     /// The tea logins for the form's hint
     logins: fn() -> Vec<String>,
 }
@@ -303,6 +308,8 @@ pub struct Options {
     pub filter: Filter,
     pub group: Group,
     pub interval: Duration,
+    /// Send desktop notifications
+    pub notify: bool,
 }
 
 pub fn run(options: Options, sources: Vec<Source>, origin: Origin, seen: Seen) -> Result<()> {
@@ -353,6 +360,7 @@ impl App {
                 prs: Vec::new(),
                 state: State::Loaded,
                 start,
+                loaded: false,
             })
             .collect::<Vec<_>>();
         App {
@@ -380,6 +388,7 @@ impl App {
             load_preview: sources::preview,
             load_reviewers: sources::reviewers,
             save_reviewers: sources::request_reviews,
+            notifier: options.notify.then_some(notify::send as fn(&Notice)),
             // Without tea, the form shows no hint
             logins: || sources::tea_logins().unwrap_or_default(),
         }
@@ -452,6 +461,7 @@ impl App {
             return;
         };
         let mut started = false;
+        let mut notices = Vec::new();
         match result {
             Ok(prs) => {
                 if feed.start {
@@ -459,8 +469,12 @@ impl App {
                     feed.start = false;
                     started = true;
                 }
+                if feed.loaded {
+                    notices = notify::changes(&feed.prs, &prs);
+                }
                 feed.prs = prs;
                 feed.state = State::Loaded;
+                feed.loaded = true;
             }
             Err(error) => {
                 feed.state = State::Failed(error.clone());
@@ -475,9 +489,28 @@ impl App {
         if started {
             self.save_seen();
         }
+        self.announce(id, notices);
         self.show();
         if done {
             self.follow = true;
+        }
+    }
+
+    /// Sends each notice, but not for a PR that an earlier source found too, as that source
+    /// sends it.
+    fn announce(&self, id: u64, notices: Vec<Notice>) {
+        let Some(send) = self.notifier else {
+            return;
+        };
+        let earlier: HashSet<&str> = self
+            .feeds
+            .iter()
+            .take_while(|f| f.id != id)
+            .flat_map(|f| &f.prs)
+            .map(|p| p.url.as_str())
+            .collect();
+        for notice in notices.iter().filter(|n| !earlier.contains(n.url.as_str())) {
+            send(notice);
         }
     }
 
@@ -576,6 +609,7 @@ impl App {
                     prs: Vec::new(),
                     state: State::Loaded,
                     start: true,
+                    loaded: false,
                 });
                 self.next_id += 1;
                 self.fetch(self.feeds.len() - 1);
@@ -588,6 +622,7 @@ impl App {
                     prs: Vec::new(),
                     state: State::Loaded,
                     start: true,
+                    loaded: false,
                 };
                 self.next_id += 1;
                 self.fetch(i);
@@ -1587,6 +1622,7 @@ mod tests {
             filter: Filter::default(),
             group,
             interval: Duration::from_secs(60),
+            notify: false,
         };
         let mut app = App::new(options, sources, Origin::Flags, Seen::memory(), tx);
         app.load = |_| Ok(Vec::new());
@@ -1824,6 +1860,25 @@ mod tests {
         app.on_key(key(KeyCode::Esc));
         app.on_key(key(KeyCode::Esc));
         assert!(matches!(app.mode, Mode::Table));
+    }
+
+    thread_local! {
+        static SENT: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    #[test]
+    fn a_reload_notifies_what_changed_once_per_pr() {
+        let (mut app, _rx) = app(Group::Repo, vec![github(), forgejo()]);
+        app.notifier = Some(|n| SENT.with(|s| s.borrow_mut().push(n.title.clone())));
+        // The first loads say nothing, and the second source finds the same PR
+        let mine = pr("GitHub", "a", 1, "me", Status::Needs);
+        app.loaded(0, Ok(vec![mine.clone()]));
+        app.loaded(1, Ok(vec![mine.clone()]));
+        let mut approved = mine.clone();
+        approved.status = Status::Approved;
+        app.loaded(0, Ok(vec![approved.clone()]));
+        app.loaded(1, Ok(vec![approved]));
+        SENT.with(|s| assert_eq!(*s.borrow(), ["Approved"]));
     }
 
     #[test]

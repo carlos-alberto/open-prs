@@ -13,6 +13,7 @@
 mod app;
 mod config;
 mod manage;
+mod notify;
 mod pr;
 mod preview;
 mod reviewers;
@@ -79,6 +80,9 @@ struct Args {
     /// Group by repo or author
     #[arg(short, long, value_enum, default_value_t = Group::Repo)]
     group: Group,
+    /// Don't send desktop notifications
+    #[arg(long)]
+    no_notify: bool,
     /// Seconds between reloads
     #[arg(short, long, value_name = "SECONDS", default_value_t = 60,
           value_parser = clap::value_parser!(u64).range(1..))]
@@ -131,6 +135,7 @@ fn main() -> ExitCode {
         filter,
         group: args.group,
         interval: Duration::from_secs(args.interval),
+        notify: !args.no_notify,
     };
     match app::run(options, sources, origin, seen) {
         Ok(()) => ExitCode::SUCCESS,

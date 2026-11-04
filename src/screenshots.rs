@@ -31,6 +31,7 @@ fn demo() -> App {
         filter: Filter::default(),
         group: Group::Repo,
         interval: Duration::from_secs(60),
+        notify: false,
     };
     let mut app = App::new(options, sources, Origin::File(config), Seen::memory(), tx);
     app.load = |_| Ok(Vec::new());

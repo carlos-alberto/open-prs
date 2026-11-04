@@ -12,7 +12,9 @@ status and comments, and shows which PRs are stacked on which.
 - PRs that changed since you last saw them are bold, and marked `new`
 - `p` previews a PR: its description, the checks that didn't pass, the files and the last
   comments
-- `v` asks people to review a PR, or stops asking them
+- `v` asks people or teams to review a PR, or stops asking them
+- Desktop notifications when a PR asks for your review, and when one of yours gets approved,
+  gets changes requested or starts to fail CI
 - Stacked PRs show as a tree under the PR they are on
 - Filters for your PRs, approved PRs, PRs that need review, review requests, new PRs,
   failing CI and drafts, and a text filter
@@ -40,7 +42,7 @@ This puts `open_prs` in `~/.cargo/bin`. It needs:
 ```
 open_prs [-m/--mine] [-a/--approved | -n/--needs-review] [-w/--for-you] [-u/--new]
          [-f/--failing] [-d/--hide-drafts] [--text WORDS] [-g/--group repo|user]
-         [-i/--interval SECONDS] [--github QUERY]... [--forgejo LOGIN]...
+         [-i/--interval SECONDS] [--no-notify] [--github QUERY]... [--forgejo LOGIN]...
 ```
 
 With no sources, it shows the PRs on github.com that involve you. The flags set how the TUI
@@ -120,6 +122,18 @@ shortens `changes requested` to `changes`. Nothing else hides: `→` scrolls the
 brings them back.
 
 ![The same PRs in 92 columns, scrolled past Host, Status and CI](docs/narrow.svg)
+
+## Notifications
+
+After the first load of each source, each reload sends a desktop notification when a PR
+starts to ask for your review, and when one of your PRs gets approved, gets changes
+requested, or starts to fail CI. One reload sends three at most: when more PRs changed, the
+third says how many. A PR that two sources find sends one.
+
+On macOS it uses `osascript`, so the notifications come from Script Editor; if none show,
+allow notifications for Script Editor in System Settings. On Linux it uses `notify-send`.
+Without either, it asks the terminal to show one (OSC 9), which some terminals do.
+`--no-notify` turns them off.
 
 ## Preview
 
