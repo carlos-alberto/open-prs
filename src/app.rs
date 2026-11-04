@@ -1,4 +1,3 @@
-use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -18,14 +17,16 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Padding, Paragraph, Row, Table, TableState};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::pr::{Group, HOSTS, Host, Pr, Status, age, pick};
+use crate::config::{self, Change, Origin, Source};
+use crate::manage::{self, Form, FormAction, List, ListRow};
+use crate::pr::{Group, Pr, Status, age, pick, shared_owner};
 use crate::sources;
 
 const TITLE: &str = "Open PRs";
 const COPIED_TIMEOUT: Duration = Duration::from_secs(5);
 const ERROR_TIMEOUT: Duration = Duration::from_secs(15);
 
-const KEYS: [(&str, &str); 8] = [
+const KEYS: [(&str, &str); 9] = [
     ("o", "Open"),
     ("y", "Copy URL"),
     ("r", "Reload"),
@@ -33,12 +34,37 @@ const KEYS: [(&str, &str); 8] = [
     ("a", "Approved"),
     ("n", "Needs review"),
     ("g", "Group"),
+    ("s", "Sources"),
     ("q", "Quit"),
 ];
 
 enum Msg {
     Input(io::Result<Event>),
-    Loaded(Host, Result<Vec<Pr>, String>),
+    /// The PRs from the feed with this id
+    Loaded(u64, Result<Vec<Pr>, String>),
+}
+
+/// A source and what it found.
+struct Feed {
+    /// Changes when the source does, so a load that started before the change is dropped
+    id: u64,
+    source: Source,
+    prs: Vec<Pr>,
+    state: State,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum State {
+    Loading,
+    Loaded,
+    /// It keeps the PRs from the last load that worked
+    Failed(String),
+}
+
+enum Mode {
+    Table,
+    Sources(List),
+    Form(Form),
 }
 
 struct Toast {
@@ -53,39 +79,39 @@ pub struct App {
     status: Option<Status>,
     group: Group,
     interval: Duration,
-    prs: BTreeMap<Host, Vec<Pr>>,
-    loading: BTreeSet<Host>,
+    feeds: Vec<Feed>,
+    next_id: u64,
+    origin: Origin,
+    mode: Mode,
     updated: Option<DateTime<Local>>,
-    /// False until both hosts first load; see `show`
+    /// False until every source first loads; see `show`
     follow: bool,
     /// The PRs on screen, in order
     rows: Vec<Pr>,
+    /// The owner every PR has, which the table leaves out
+    owner: Option<String>,
     table: TableState,
     /// Where the table was last drawn, to map mouse clicks to rows
     table_area: Rect,
     toasts: Vec<Toast>,
     tx: Sender<Msg>,
     quit: bool,
+    /// Loads a source; the tests replace it, so they don't run gh or tea
+    load: fn(&Source) -> Result<Vec<Pr>>,
+    /// The tea logins for the form's hint
+    logins: fn() -> Vec<String>,
 }
 
-pub fn run(mine: bool, status: Option<Status>, group: Group, interval: Duration) -> Result<()> {
+pub struct Options {
+    pub mine: bool,
+    pub status: Option<Status>,
+    pub group: Group,
+    pub interval: Duration,
+}
+
+pub fn run(options: Options, sources: Vec<Source>, origin: Origin) -> Result<()> {
     let (tx, rx) = mpsc::channel();
-    let mut app = App {
-        mine,
-        status,
-        group,
-        interval,
-        prs: BTreeMap::new(),
-        loading: BTreeSet::new(),
-        updated: None,
-        follow: false,
-        rows: Vec::new(),
-        table: TableState::new(),
-        table_area: Rect::default(),
-        toasts: Vec::new(),
-        tx: tx.clone(),
-        quit: false,
-    };
+    let mut app = App::new(options, sources, origin, tx.clone());
 
     let mut terminal = ratatui::init();
     let result = execute!(io::stdout(), EnableMouseCapture)
@@ -113,6 +139,41 @@ fn read_input(tx: Sender<Msg>) {
 }
 
 impl App {
+    fn new(options: Options, sources: Vec<Source>, origin: Origin, tx: Sender<Msg>) -> Self {
+        let feeds = sources
+            .into_iter()
+            .zip(0..)
+            .map(|(source, id)| Feed {
+                id,
+                source,
+                prs: Vec::new(),
+                state: State::Loaded,
+            })
+            .collect::<Vec<_>>();
+        App {
+            mine: options.mine,
+            status: options.status,
+            group: options.group,
+            interval: options.interval,
+            next_id: feeds.len() as u64,
+            feeds,
+            origin,
+            mode: Mode::Table,
+            updated: None,
+            follow: false,
+            rows: Vec::new(),
+            owner: None,
+            table: TableState::new(),
+            table_area: Rect::default(),
+            toasts: Vec::new(),
+            tx,
+            quit: false,
+            load: sources::fetch,
+            // Without tea, the form shows no hint
+            logins: || sources::tea_logins().unwrap_or_default(),
+        }
+    }
+
     fn run(&mut self, terminal: &mut DefaultTerminal, rx: Receiver<Msg>) -> Result<()> {
         self.reload();
         let mut next_reload = Instant::now() + self.interval;
@@ -128,7 +189,7 @@ impl App {
                 .fold(next_reload.min(now + Duration::from_secs(1)), Instant::min);
             match rx.recv_timeout(wake.saturating_duration_since(now)) {
                 Ok(Msg::Input(event)) => self.on_event(event?),
-                Ok(Msg::Loaded(host, result)) => self.loaded(host, result),
+                Ok(Msg::Loaded(id, result)) => self.loaded(id, result),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -145,42 +206,54 @@ impl App {
         Ok(())
     }
 
-    fn reload(&mut self) {
-        // A slow Forgejo load must not stack up behind the timer
-        if !self.loading.is_empty() {
-            return;
-        }
-        self.loading = HOSTS.into_iter().collect();
-        self.show();
-        // Show each host as soon as it answers; GitHub is one call, Forgejo is one per PR
-        for host in HOSTS {
-            let tx = self.tx.clone();
-            thread::spawn(move || {
-                let result = sources::fetch(host).map_err(|e| format!("{e:#}"));
-                let _ = tx.send(Msg::Loaded(host, result));
-            });
-        }
+    fn loading(&self) -> bool {
+        self.feeds.iter().any(|f| f.state == State::Loading)
     }
 
-    fn loaded(&mut self, host: Host, result: Result<Vec<Pr>, String>) {
-        self.loading.remove(&host);
+    fn reload(&mut self) {
+        // A slow source must not stack up behind the timer
+        if self.loading() {
+            return;
+        }
+        for i in 0..self.feeds.len() {
+            self.fetch(i);
+        }
+        self.show();
+    }
+
+    /// Loads one source in the background; each shows as soon as it answers.
+    fn fetch(&mut self, i: usize) {
+        let feed = &mut self.feeds[i];
+        feed.state = State::Loading;
+        let (id, source, tx, load) = (feed.id, feed.source.clone(), self.tx.clone(), self.load);
+        thread::spawn(move || {
+            let result = load(&source).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Msg::Loaded(id, result));
+        });
+    }
+
+    fn loaded(&mut self, id: u64, result: Result<Vec<Pr>, String>) {
+        // The source changed or went away while it loaded
+        let Some(feed) = self.feeds.iter_mut().find(|f| f.id == id) else {
+            return;
+        };
         match result {
             Ok(prs) => {
-                self.prs.insert(host, prs);
+                feed.prs = prs;
+                feed.state = State::Loaded;
             }
-            // Keep the last list from this host on screen
-            Err(error) => self.notify(
-                format!("{} failed", host.name()),
-                error,
-                true,
-                ERROR_TIMEOUT,
-            ),
+            Err(error) => {
+                feed.state = State::Failed(error.clone());
+                let title = format!("{} failed", feed.source.name());
+                self.notify(title, error, true, ERROR_TIMEOUT);
+            }
         }
-        if self.loading.is_empty() {
+        let done = !self.loading();
+        if done {
             self.updated = Some(Local::now());
         }
         self.show();
-        if self.loading.is_empty() {
+        if done {
             self.follow = true;
         }
     }
@@ -189,18 +262,15 @@ impl App {
     fn show(&mut self) {
         let current = self.selected().map(|p| p.url.clone());
         let row = self.table.selected().unwrap_or(0);
-        self.rows = pick(
-            self.prs.values().flatten(),
-            self.mine,
-            self.status,
-            self.group,
-        );
+        let all = || self.feeds.iter().flat_map(|f| &f.prs);
+        self.owner = shared_owner(all());
+        self.rows = pick(all(), self.mine, self.status, self.group);
         if self.rows.is_empty() {
             self.table.select(None);
             return;
         }
-        // Follow the PR under the cursor once both hosts have loaded. Before that, keep the
-        // row, so the cursor doesn't follow GitHub's first PR down when Forgejo's arrive above it
+        // Follow the PR under the cursor once every source has loaded. Before that, keep the
+        // row, so the cursor doesn't follow one source's first PR down when another's arrive above it
         let mut index = row.min(self.rows.len() - 1);
         if self.follow
             && let Some(i) = current.and_then(|url| self.rows.iter().position(|p| p.url == url))
@@ -223,18 +293,65 @@ impl App {
         });
     }
 
+    /// Makes a change to the sources, and saves it when they came from the config file.
+    fn change(&mut self, change: Change) -> Result<(), String> {
+        if let Origin::File(path) = &self.origin {
+            let current: Vec<Source> = self.feeds.iter().map(|f| f.source.clone()).collect();
+            config::save(path, &current, &change).map_err(|e| format!("{e:#}"))?;
+        }
+        match change {
+            Change::Add(source) => {
+                self.feeds.push(Feed {
+                    id: self.next_id,
+                    source,
+                    prs: Vec::new(),
+                    state: State::Loaded,
+                });
+                self.next_id += 1;
+                self.fetch(self.feeds.len() - 1);
+            }
+            Change::Update(i, source) => {
+                // The old PRs came from the old settings
+                self.feeds[i] = Feed {
+                    id: self.next_id,
+                    source,
+                    prs: Vec::new(),
+                    state: State::Loaded,
+                };
+                self.next_id += 1;
+                self.fetch(i);
+            }
+            Change::Remove(i) => {
+                self.feeds.remove(i);
+            }
+        }
+        self.show();
+        Ok(())
+    }
+
     fn on_event(&mut self, event: Event) {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key(key),
-            Event::Mouse(mouse) => self.on_mouse(mouse),
+            Event::Mouse(mouse) if matches!(self.mode, Mode::Table) => self.on_mouse(mouse),
             _ => {}
         }
     }
 
     fn on_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.quit = true;
+            return;
+        }
+        match std::mem::replace(&mut self.mode, Mode::Table) {
+            Mode::Table => self.on_table_key(key),
+            Mode::Sources(list) => self.on_sources_key(list, key),
+            Mode::Form(form) => self.on_form_key(form, key),
+        }
+    }
+
+    fn on_table_key(&mut self, key: KeyEvent) {
         let page = usize::from(self.table_area.height.saturating_sub(1)).max(1);
         match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Enter | KeyCode::Char('o') => self.open_pr(),
             KeyCode::Char('y') => self.copy_url(),
@@ -249,6 +366,7 @@ impl App {
                 self.group = self.group.toggled();
                 self.show();
             }
+            KeyCode::Char('s') => self.mode = Mode::Sources(List::default()),
             KeyCode::Down => self.move_cursor(1),
             KeyCode::Up => self.move_cursor(-1),
             KeyCode::PageDown => self.move_cursor(page as isize),
@@ -256,6 +374,66 @@ impl App {
             KeyCode::Home => self.move_cursor(isize::MIN),
             KeyCode::End => self.move_cursor(isize::MAX),
             _ => {}
+        }
+    }
+
+    fn on_sources_key(&mut self, mut list: List, key: KeyEvent) {
+        list.message = None;
+        if list.confirm {
+            list.confirm = false;
+            if key.code == KeyCode::Char('y') {
+                if self.feeds.len() == 1 {
+                    list.message = Some("Add another source before you delete the last one".into());
+                } else if let Err(error) = self.change(Change::Remove(list.cursor)) {
+                    list.message = Some(error);
+                }
+                list.cursor = list.cursor.min(self.feeds.len() - 1);
+            }
+            self.mode = Mode::Sources(list);
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('s' | 'q') => return,
+            KeyCode::Down => list.cursor = (list.cursor + 1).min(self.feeds.len() - 1),
+            KeyCode::Up => list.cursor = list.cursor.saturating_sub(1),
+            KeyCode::Char('a') => {
+                self.mode = Mode::Form(Form::add((self.logins)()));
+                return;
+            }
+            KeyCode::Char('e') | KeyCode::Enter => {
+                let source = &self.feeds[list.cursor].source;
+                self.mode = Mode::Form(Form::edit(list.cursor, source, (self.logins)()));
+                return;
+            }
+            KeyCode::Char('d') => list.confirm = true,
+            _ => {}
+        }
+        self.mode = Mode::Sources(list);
+    }
+
+    fn on_form_key(&mut self, mut form: Form, key: KeyEvent) {
+        let back = |cursor| {
+            Mode::Sources(List {
+                cursor,
+                ..List::default()
+            })
+        };
+        match form.on_key(key) {
+            FormAction::None => self.mode = Mode::Form(form),
+            FormAction::Cancel => self.mode = back(form.editing.unwrap_or(0)),
+            FormAction::Save(source) => {
+                let (change, cursor) = match form.editing {
+                    Some(i) => (Change::Update(i, source), i),
+                    None => (Change::Add(source), self.feeds.len()),
+                };
+                match self.change(change) {
+                    Ok(()) => self.mode = back(cursor),
+                    Err(error) => {
+                        form.error = Some(error);
+                        self.mode = Mode::Form(form);
+                    }
+                }
+            }
         }
     }
 
@@ -374,10 +552,15 @@ impl App {
         if let Some(status) = self.status {
             parts.push(format!("{} only", status.label()));
         }
-        if !self.loading.is_empty() {
-            let mut names: Vec<_> = self.loading.iter().map(|h| h.name()).collect();
-            names.sort();
-            parts.push(format!("loading {}…", names.join(" and ")));
+        let mut loading: Vec<_> = self
+            .feeds
+            .iter()
+            .filter(|f| f.state == State::Loading)
+            .map(|f| f.source.name())
+            .collect();
+        if !loading.is_empty() {
+            loading.sort();
+            parts.push(format!("loading {}…", loading.join(" and ")));
         } else if let Some(updated) = self.updated {
             parts.push(format!(
                 "updated {}, every {}s",
@@ -405,19 +588,52 @@ impl App {
         self.table_area = body;
         let table = self.table_widget(Utc::now());
         frame.render_stateful_widget(table, body, &mut self.table);
+        frame.render_widget(manage::keys(&KEYS), footer);
 
-        let keys: Vec<Span> = KEYS
-            .iter()
-            .flat_map(|(key, label)| {
-                [
-                    Span::styled(format!(" {key} "), Style::new().bold().reversed()),
-                    Span::raw(format!(" {label}  ")),
-                ]
-            })
-            .collect();
-        frame.render_widget(Line::from(keys), footer);
-
+        match &self.mode {
+            Mode::Table => {}
+            Mode::Sources(list) => {
+                manage::draw_list(frame, body, list, &self.source_rows(), &self.save_note());
+            }
+            Mode::Form(form) => form.draw(frame, body),
+        }
         self.draw_toasts(frame, body);
+    }
+
+    fn source_rows(&self) -> Vec<ListRow> {
+        self.feeds
+            .iter()
+            .map(|f| {
+                let (state, style) = match &f.state {
+                    State::Loading => ("loading…".into(), Style::new().dim()),
+                    State::Loaded => (format!("{} PRs", f.prs.len()), Style::new().green()),
+                    State::Failed(_) => ("failed".into(), Style::new().red()),
+                };
+                ListRow {
+                    name: f.source.name().into(),
+                    what: f.source.describe(),
+                    state,
+                    state_style: style,
+                    error: match &f.state {
+                        State::Failed(error) => Some(clean(error)),
+                        _ => None,
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// Where changes to the sources go.
+    fn save_note(&self) -> String {
+        match &self.origin {
+            Origin::File(path) => format!("Changes save to {}", tilde(&path.display().to_string())),
+            Origin::Flags => {
+                "These come from --github and --forgejo, so changes last until you quit".into()
+            }
+            Origin::Nowhere => {
+                "There is no home folder to save to, so changes last until you quit".into()
+            }
+        }
     }
 
     fn table_widget(&self, now: DateTime<Utc>) -> Table<'static> {
@@ -427,30 +643,28 @@ impl App {
         } else {
             &["Author", "Host", "PR", "Status", "Updated", "Title"]
         };
+        let owner = self.owner.as_deref();
 
         let mut cells: Vec<Vec<(String, Style)>> = Vec::with_capacity(self.rows.len());
-        let mut last: Option<(&str, Option<Host>)> = None;
+        let mut last: Option<(&str, Option<&str>)> = None;
         for p in &self.rows {
             // Name each group once, so the blank cells under it show where it ends
             let group = if by_repo {
-                (p.repo.as_str(), Some(p.host))
+                (p.repo.as_str(), Some(p.host.as_str()))
             } else {
                 (p.author.as_str(), None)
             };
             let label = if Some(group) == last {
                 String::new()
             } else if by_repo {
-                p.short_repo().to_owned()
+                p.repo_without(owner).to_owned()
             } else {
                 p.author.clone()
             };
             last = Some(group);
 
             let plain = Style::new();
-            let mut row = vec![
-                (label, plain),
-                (p.host.name().to_owned(), Style::new().dim()),
-            ];
+            let mut row = vec![(label, plain), (p.host.clone(), Style::new().dim())];
             let status = (
                 p.status.label().to_owned(),
                 Style::new().fg(p.status.color()),
@@ -462,7 +676,10 @@ impl App {
                     (p.author.clone(), plain),
                 ]);
             } else {
-                row.extend([(format!("{}#{}", p.short_repo(), p.number), plain), status]);
+                row.extend([
+                    (format!("{}#{}", p.repo_without(owner), p.number), plain),
+                    status,
+                ]);
             }
             row.extend([(age(p.updated, now), plain), (p.title.clone(), plain)]);
             cells.push(row);
@@ -530,6 +747,16 @@ impl App {
                 rect,
             );
         }
+    }
+}
+
+/// `path` with the home folder as `~`.
+fn tilde(path: &str) -> String {
+    match std::env::home_dir().map(|h| h.display().to_string()) {
+        Some(home) if !home.is_empty() && path.starts_with(&home) => {
+            format!("~{}", &path[home.len()..])
+        }
+        _ => path.to_owned(),
     }
 }
 
@@ -623,87 +850,110 @@ mod tests {
     use super::*;
     use crate::pr::tests::pr;
 
-    fn app(group: Group) -> App {
-        let (tx, _rx) = mpsc::channel();
-        App {
+    fn github() -> Source {
+        Source::github("org:acme", None, None)
+    }
+
+    fn forgejo() -> Source {
+        Source::forgejo("Forgejo", None, None)
+    }
+
+    /// An app with these sources, whose changes last until the test ends.
+    fn app(group: Group, sources: Vec<Source>) -> (App, Receiver<Msg>) {
+        let (tx, rx) = mpsc::channel();
+        let options = Options {
             mine: false,
             status: None,
             group,
             interval: Duration::from_secs(60),
-            prs: BTreeMap::new(),
-            loading: BTreeSet::new(),
-            updated: None,
-            follow: false,
-            rows: Vec::new(),
-            table: TableState::new(),
-            table_area: Rect::default(),
-            toasts: Vec::new(),
-            tx,
-            quit: false,
-        }
+        };
+        let mut app = App::new(options, sources, Origin::Flags, tx);
+        app.load = |_| Ok(Vec::new());
+        app.logins = || vec!["home".into()];
+        (app, rx)
     }
 
     fn selected_number(app: &App) -> Option<u64> {
         app.selected().map(|p| p.number)
     }
 
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
     #[test]
-    fn cursor_keeps_its_row_until_both_hosts_load_then_follows_the_pr() {
-        let mut app = app(Group::Repo);
-        app.loading = HOSTS.into_iter().collect();
+    fn cursor_keeps_its_row_until_every_source_loads_then_follows_the_pr() {
+        let (mut app, _rx) = app(Group::Repo, vec![github(), forgejo()]);
+        app.feeds.iter_mut().for_each(|f| f.state = State::Loading);
         app.loaded(
-            Host::GitHub,
+            0,
             Ok(vec![
-                pr(Host::GitHub, "b", 1, "x", Status::Needs),
-                pr(Host::GitHub, "b", 2, "x", Status::Needs),
+                pr("GitHub", "b", 1, "x", Status::Needs),
+                pr("GitHub", "b", 2, "x", Status::Needs),
             ]),
         );
         app.move_cursor(1);
         assert_eq!(selected_number(&app), Some(2));
 
         // Forgejo's PR sorts above, so the row stays and the PR under it changes
-        app.loaded(
-            Host::Forgejo,
-            Ok(vec![pr(Host::Forgejo, "a", 7, "x", Status::Needs)]),
-        );
+        app.loaded(1, Ok(vec![pr("Forgejo", "a", 7, "x", Status::Needs)]));
         assert_eq!(app.table.selected(), Some(1));
         assert!(app.follow);
 
         // Now the cursor follows the PR when a filter moves the rows
         app.toggle_status(Status::Needs);
-        app.prs.get_mut(&Host::Forgejo).unwrap().push(pr(
-            Host::Forgejo,
-            "a",
-            3,
-            "x",
-            Status::Needs,
-        ));
+        app.feeds[1]
+            .prs
+            .push(pr("Forgejo", "a", 3, "x", Status::Needs));
         app.show();
         assert_eq!(selected_number(&app), Some(1));
         assert_eq!(app.table.selected(), Some(2));
     }
 
     #[test]
-    fn a_failed_host_keeps_its_last_list() {
-        let mut app = app(Group::Repo);
-        app.prs.insert(
-            Host::GitHub,
-            vec![pr(Host::GitHub, "a", 1, "x", Status::Needs)],
-        );
-        app.loading = [Host::GitHub].into_iter().collect();
-        app.loaded(Host::GitHub, Err("HTTP 502".into()));
+    fn a_failed_source_keeps_its_last_list() {
+        let (mut app, _rx) = app(Group::Repo, vec![github()]);
+        app.feeds[0].prs = vec![pr("GitHub", "a", 1, "x", Status::Needs)];
+        app.feeds[0].state = State::Loading;
+        app.loaded(0, Err("HTTP 502".into()));
         assert_eq!(app.rows.len(), 1);
         assert_eq!(app.toasts.len(), 1);
         assert_eq!(app.toasts[0].title, "GitHub failed");
+        assert_eq!(app.feeds[0].state, State::Failed("HTTP 502".into()));
         assert!(app.updated.is_some());
     }
 
     #[test]
+    fn a_load_for_a_source_that_changed_is_dropped() {
+        let (mut app, _rx) = app(Group::Repo, vec![github(), forgejo()]);
+        app.change(Change::Update(0, Source::github("org:other", None, None)))
+            .unwrap();
+        // 0 was the id before the change
+        app.loaded(0, Ok(vec![pr("GitHub", "a", 1, "x", Status::Needs)]));
+        assert!(app.rows.is_empty());
+        assert_eq!(app.feeds[0].state, State::Loading);
+    }
+
+    #[test]
     fn subtitle_lists_the_filters_and_the_load_state() {
-        let mut app = app(Group::User);
+        let (mut app, _rx) = app(Group::User, vec![github(), forgejo()]);
         app.mine = true;
         app.status = Some(Status::Approved);
-        app.loading = HOSTS.into_iter().collect();
+        app.feeds.iter_mut().for_each(|f| f.state = State::Loading);
         assert_eq!(
             app.subtitle(),
             "0 PRs · by user · mine · approved only · loading Forgejo and GitHub…"
@@ -711,40 +961,85 @@ mod tests {
     }
 
     #[test]
-    fn group_labels_show_once_per_group() {
-        let mut app = app(Group::Repo);
-        app.prs.insert(
-            Host::GitHub,
-            vec![
-                pr(Host::GitHub, "a", 1, "x", Status::Needs),
-                pr(Host::GitHub, "a", 2, "x", Status::Needs),
-                pr(Host::GitHub, "b", 1, "x", Status::Needs),
-            ],
-        );
-        app.prs.insert(
-            Host::Forgejo,
-            vec![pr(Host::Forgejo, "a", 1, "x", Status::Needs)],
-        );
+    fn group_labels_show_once_per_group_and_leave_out_a_shared_owner() {
+        let (mut app, _rx) = app(Group::Repo, vec![github(), forgejo()]);
+        app.feeds[0].prs = vec![
+            pr("GitHub", "a", 1, "x", Status::Needs),
+            pr("GitHub", "a", 2, "x", Status::Needs),
+            pr("GitHub", "b", 1, "x", Status::Needs),
+        ];
+        app.feeds[1].prs = vec![pr("Forgejo", "a", 1, "x", Status::Needs)];
         app.show();
-
-        let backend = ratatui::backend::TestBackend::new(80, 6);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let mut state = TableState::new();
-        terminal
-            .draw(|f| f.render_stateful_widget(app.table_widget(Utc::now()), f.area(), &mut state))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let first_column: Vec<String> = (1..5)
-            .map(|y| {
-                (0..4)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-                    .trim()
-                    .to_owned()
-            })
-            .collect();
+        let first_column = |lines: &[String]| -> Vec<String> {
+            lines[2..6]
+                .iter()
+                .map(|l| l.split("  ").next().unwrap().trim().to_owned())
+                .collect()
+        };
         // Forgejo's a and GitHub's a are separate groups
-        assert_eq!(first_column, ["a", "a", "", "b"]);
+        assert_eq!(first_column(&screen(&mut app, 80, 8)), ["a", "a", "", "b"]);
+
+        // With a second owner, every repo shows its owner
+        app.feeds[1].prs[0].repo = "other/a".into();
+        app.show();
+        assert_eq!(
+            first_column(&screen(&mut app, 80, 8)),
+            ["acme/a", "", "acme/b", "other/a"]
+        );
+    }
+
+    #[test]
+    fn the_sources_panel_adds_edits_and_deletes() {
+        let (mut app, _rx) = app(Group::Repo, vec![github()]);
+        app.feeds[0].state = State::Failed("HTTP 401: Bad credentials\nTry gh auth login".into());
+        app.on_key(key(KeyCode::Char('s')));
+        let lines = screen(&mut app, 100, 16);
+        let shows = |text: &str| lines.iter().any(|l| l.contains(text));
+        assert!(shows("github.com: org:acme"));
+        assert!(shows("changes last until you quit"));
+        // Only the first line of the error fits
+        assert!(shows("GitHub failed: HTTP 401: Bad credentials "));
+
+        // Add a Forgejo source
+        app.on_key(key(KeyCode::Char('a')));
+        app.on_key(key(KeyCode::Right));
+        for _ in 0..2 {
+            app.on_key(key(KeyCode::Tab));
+        }
+        for c in "home".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(&app.mode, Mode::Sources(list) if list.cursor == 1));
+        assert_eq!(app.feeds[1].source, Source::forgejo("home", None, None));
+        assert_eq!(app.feeds[1].state, State::Loading);
+
+        // Rename it
+        app.on_key(key(KeyCode::Char('e')));
+        for c in "Home".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.feeds[1].source.name(), "Home");
+
+        // Delete the first one; d asks first, and another key keeps it
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Char('d')));
+        app.on_key(key(KeyCode::Char('n')));
+        assert_eq!(app.feeds.len(), 2);
+        app.on_key(key(KeyCode::Char('d')));
+        app.on_key(key(KeyCode::Char('y')));
+        assert_eq!(app.feeds.len(), 1);
+        assert_eq!(app.feeds[0].source.name(), "Home");
+
+        // The last one stays
+        app.on_key(key(KeyCode::Char('d')));
+        app.on_key(key(KeyCode::Char('y')));
+        assert_eq!(app.feeds.len(), 1);
+        assert!(matches!(&app.mode, Mode::Sources(list) if list.message.is_some()));
+
+        app.on_key(key(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Table));
     }
 
     #[test]
@@ -775,15 +1070,12 @@ mod tests {
 
     #[test]
     fn draw_shows_the_header_table_footer_and_toasts() {
-        let mut app = app(Group::Repo);
-        app.prs.insert(
-            Host::GitHub,
-            vec![
-                pr(Host::GitHub, "billing", 4012, "amy", Status::Needs),
-                pr(Host::GitHub, "billing", 4018, "me", Status::Approved),
-                pr(Host::GitHub, "web", 1207, "zed", Status::Changes),
-            ],
-        );
+        let (mut app, _rx) = app(Group::Repo, vec![github()]);
+        app.feeds[0].prs = vec![
+            pr("GitHub", "billing", 4012, "amy", Status::Needs),
+            pr("GitHub", "billing", 4018, "me", Status::Approved),
+            pr("GitHub", "web", 1207, "zed", Status::Changes),
+        ];
         app.show();
         app.notify(
             "GitHub failed".into(),
@@ -791,23 +1083,13 @@ mod tests {
             true,
             ERROR_TIMEOUT,
         );
-
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
-        terminal.draw(|f| app.draw(f)).unwrap();
-        let buffer = terminal.backend().buffer();
-        let lines: Vec<String> = (0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect()
-            })
-            .collect();
+        let lines = screen(&mut app, 110, 12);
         assert!(lines[0].contains("Open PRs — 3 PRs · by repo"));
         assert!(lines[1].starts_with("Repo     Host    #      Status"));
         assert!(lines[2].starts_with("billing  GitHub  #4012  needs review"));
         assert!(lines[3].starts_with("         GitHub  #4018  approved"));
         assert!(lines.iter().any(|l| l.contains(" GitHub failed ")));
         assert!(lines[11].starts_with(" o  Open"));
+        assert!(lines[11].contains(" s  Sources"));
     }
 }

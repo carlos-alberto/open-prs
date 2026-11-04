@@ -10,16 +10,24 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::pr::{Host, ORG, Pr, Status};
+use crate::config::{Kind, Source};
+use crate::pr::{Pr, Status};
 
-/// tea login for https://git.example.com, signed with the ssh-agent key
-const TEA_LOGIN: &str = "work";
-
-pub fn fetch(host: Host) -> Result<Vec<Pr>> {
-    match host {
-        Host::GitHub => github(),
-        Host::Forgejo => forgejo(),
+pub fn fetch(source: &Source) -> Result<Vec<Pr>> {
+    match &source.kind {
+        Kind::GitHub { query, hostname } => github(source.name(), query, hostname.as_deref()),
+        Kind::Forgejo { login, owner } => forgejo(source.name(), login, owner.as_deref()),
     }
+}
+
+/// The names of the logins tea has, to help pick one.
+pub fn tea_logins() -> Result<Vec<String>> {
+    Ok(logins()?.into_iter().map(|l| l.name).collect())
+}
+
+fn logins() -> Result<Vec<TeaLogin>> {
+    serde_json::from_str(&run(&["tea", "logins", "list", "-o", "json"])?)
+        .context("could not read the logins from tea")
 }
 
 fn run(cmd: &[&str]) -> Result<String> {
@@ -109,21 +117,18 @@ struct GhReview {
     state: String,
 }
 
-fn github() -> Result<Vec<Pr>> {
-    let out = run(&[
-        "gh",
-        "api",
-        "graphql",
-        "--paginate",
-        "-f",
-        &format!("q=is:pr is:open org:{ORG}"),
-        "-f",
-        &format!("query={GITHUB_QUERY}"),
-    ])?;
-    parse_github(&out)
+fn github(name: &str, query: &str, hostname: Option<&str>) -> Result<Vec<Pr>> {
+    let search = format!("q=is:pr is:open {query}");
+    let graphql = format!("query={GITHUB_QUERY}");
+    let mut cmd = vec!["gh", "api"];
+    if let Some(hostname) = hostname {
+        cmd.extend(["--hostname", hostname]);
+    }
+    cmd.extend(["graphql", "--paginate", "-f", &search, "-f", &graphql]);
+    parse_github(name, &run(&cmd)?)
 }
 
-fn parse_github(out: &str) -> Result<Vec<Pr>> {
+fn parse_github(name: &str, out: &str) -> Result<Vec<Pr>> {
     let mut prs = Vec::new();
     // --paginate prints one JSON document per page
     for page in serde_json::Deserializer::from_str(out).into_iter::<GhPage>() {
@@ -145,7 +150,7 @@ fn parse_github(out: &str) -> Result<Vec<Pr>> {
             });
             let author = n.author.map_or_else(|| "ghost".into(), |a| a.login);
             prs.push(Pr {
-                host: Host::GitHub,
+                host: name.into(),
                 repo: n.repository.name_with_owner,
                 number: n.number,
                 title: n.title,
@@ -164,10 +169,10 @@ fn parse_github(out: &str) -> Result<Vec<Pr>> {
     Ok(prs)
 }
 
-fn tea<T: DeserializeOwned + Default>(args: &[&str]) -> Result<T> {
+fn tea<T: DeserializeOwned + Default>(login: &str, args: &[&str]) -> Result<T> {
     let mut cmd = vec!["tea"];
     cmd.extend_from_slice(args);
-    cmd.extend_from_slice(&["--login", TEA_LOGIN, "-o", "json"]);
+    cmd.extend_from_slice(&["--login", login, "-o", "json"]);
     let out = run(&cmd)?;
     if out.trim().is_empty() {
         return Ok(T::default());
@@ -206,19 +211,20 @@ struct TeaReview {
     state: String,
 }
 
-fn forgejo() -> Result<Vec<Pr>> {
-    let logins: Vec<TeaLogin> =
-        serde_json::from_str(&run(&["tea", "logins", "list", "-o", "json"])?)
-            .context("could not read the logins from tea")?;
-    let me = logins
+fn forgejo(name: &str, login: &str, owner: Option<&str>) -> Result<Vec<Pr>> {
+    let Some(me) = logins()?
         .into_iter()
-        .find(|l| l.name == TEA_LOGIN)
-        .map(|l| l.user);
+        .find(|l| l.name == login)
+        .map(|l| l.user)
+    else {
+        bail!("tea has no login named {login:?}; `tea logins list` shows them");
+    };
 
     let mut listed: Vec<TeaIssue> = Vec::new();
     for page in 1.. {
+        let page = page.to_string();
         // --repo / stops tea from limiting the search to the repo in $PWD
-        let batch: Vec<TeaIssue> = tea(&[
+        let mut args = vec![
             "issues",
             "list",
             "--repo",
@@ -230,10 +236,15 @@ fn forgejo() -> Result<Vec<Pr>> {
             "--limit",
             "50",
             "--page",
-            &page.to_string(),
+            &page,
             "-f",
             "index,title,url,author-id,owner,repo,updated",
-        ])?;
+        ];
+        // Without an owner, a public instance returns the PRs of every public repo
+        if let Some(owner) = owner {
+            args.extend(["--owner", owner]);
+        }
+        let batch: Vec<TeaIssue> = tea(login, &args)?;
         if batch.is_empty() {
             break;
         }
@@ -242,9 +253,9 @@ fn forgejo() -> Result<Vec<Pr>> {
 
     let status = |pr: &TeaIssue| -> Result<Pr> {
         let repo = format!("{}/{}", pr.owner, pr.repo);
-        let pull: TeaPull = tea(&["pulls", &pr.index, "--repo", &repo])?;
+        let pull: TeaPull = tea(login, &["pulls", &pr.index, "--repo", &repo])?;
         Ok(Pr {
-            host: Host::Forgejo,
+            host: name.into(),
             number: pr
                 .index
                 .parse()
@@ -255,7 +266,7 @@ fn forgejo() -> Result<Vec<Pr>> {
             author: pr.author_id.clone(),
             status: forgejo_status(pull.reviews.unwrap_or_default()),
             updated: pr.updated,
-            mine: me.as_deref() == Some(pr.author_id.as_str()),
+            mine: pr.author_id == me,
         })
     };
 
@@ -404,7 +415,7 @@ mod tests {
                 .join(",")
             ),
         );
-        let prs = parse_github(&out).unwrap();
+        let prs = parse_github("GitHub", &out).unwrap();
         let got: Vec<_> = prs
             .iter()
             .map(|p| (p.number, p.status, p.author.as_str(), p.mine))

@@ -1,25 +1,7 @@
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 use ratatui::style::Color;
-
-pub const ORG: &str = "acme";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Host {
-    GitHub,
-    Forgejo,
-}
-
-/// Each host is loaded separately, so one that fails keeps its last list on screen.
-pub const HOSTS: [Host; 2] = [Host::GitHub, Host::Forgejo];
-
-impl Host {
-    pub fn name(self) -> &'static str {
-        match self {
-            Host::GitHub => "GitHub",
-            Host::Forgejo => "Forgejo",
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -70,7 +52,9 @@ impl Group {
 
 #[derive(Clone, Debug)]
 pub struct Pr {
-    pub host: Host,
+    /// The name of the source that found it
+    pub host: String,
+    /// owner/name
     pub repo: String,
     pub number: u64,
     pub title: String,
@@ -82,38 +66,47 @@ pub struct Pr {
 }
 
 impl Pr {
-    /// The repo name without the org, which every PR shares.
-    pub fn short_repo(&self) -> &str {
-        self.repo
-            .strip_prefix(ORG)
+    pub fn owner(&self) -> &str {
+        self.repo.split_once('/').map_or("", |(owner, _)| owner)
+    }
+
+    /// The repo without `owner/` in front, when the owner is the given one.
+    pub fn repo_without<'a>(&'a self, owner: Option<&str>) -> &'a str {
+        owner
+            .and_then(|o| self.repo.strip_prefix(o))
             .and_then(|r| r.strip_prefix('/'))
             .unwrap_or(&self.repo)
     }
 }
 
-/// The PRs to show, in the order to show them.
+/// The owner of every PR, if they all have the same one, so the table can leave it out.
+pub fn shared_owner<'a>(prs: impl IntoIterator<Item = &'a Pr>) -> Option<String> {
+    let mut owners = prs.into_iter().map(Pr::owner);
+    let first = owners.next()?;
+    owners.all(|o| o == first).then(|| first.to_owned())
+}
+
+/// The PRs to show, in the order to show them. When two sources find the same PR, the
+/// first one's copy stays.
 pub fn pick<'a>(
     prs: impl IntoIterator<Item = &'a Pr>,
     mine: bool,
     status: Option<Status>,
     group: Group,
 ) -> Vec<Pr> {
+    let mut seen = HashSet::new();
     let mut prs: Vec<Pr> = prs
         .into_iter()
         .filter(|p| (p.mine || !mine) && status.is_none_or(|s| s == p.status))
+        .filter(|p| seen.insert(p.url.as_str()))
         .cloned()
         .collect();
     match group {
-        Group::Repo => prs.sort_by(|a, b| {
-            (&a.repo, a.host.name(), a.number).cmp(&(&b.repo, b.host.name(), b.number))
-        }),
+        Group::Repo => {
+            prs.sort_by(|a, b| (&a.repo, &a.host, a.number).cmp(&(&b.repo, &b.host, b.number)))
+        }
         Group::User => prs.sort_by(|a, b| {
-            (&a.author, &a.repo, a.host.name(), a.number).cmp(&(
-                &b.author,
-                &b.repo,
-                b.host.name(),
-                b.number,
-            ))
+            (&a.author, &a.repo, &a.host, a.number).cmp(&(&b.author, &b.repo, &b.host, b.number))
         }),
     }
     prs
@@ -133,13 +126,19 @@ pub fn age(t: DateTime<Utc>, now: DateTime<Utc>) -> String {
 pub mod tests {
     use super::*;
 
-    pub fn pr(host: Host, repo: &str, number: u64, author: &str, status: Status) -> Pr {
+    /// A PR in `repo`, which is `owner/name` or a name in the `acme` org.
+    pub fn pr(host: &str, repo: &str, number: u64, author: &str, status: Status) -> Pr {
+        let repo = if repo.contains('/') {
+            repo.to_owned()
+        } else {
+            format!("acme/{repo}")
+        };
         Pr {
-            host,
-            repo: format!("{ORG}/{repo}"),
+            host: host.into(),
+            url: format!("https://{host}.example.com/{repo}/{number}"),
+            repo,
             number,
             title: format!("PR {number}"),
-            url: format!("https://{}.example.com/{repo}/{number}", host.name()),
             author: author.into(),
             status,
             updated: DateTime::UNIX_EPOCH,
@@ -150,31 +149,30 @@ pub mod tests {
     #[test]
     fn pick_sorts_by_repo_then_host_then_number() {
         let prs = [
-            pr(Host::GitHub, "b", 1, "x", Status::Needs),
-            pr(Host::GitHub, "a", 2, "x", Status::Needs),
-            pr(Host::Forgejo, "a", 9, "x", Status::Needs),
-            pr(Host::GitHub, "a", 1, "x", Status::Needs),
+            pr("GitHub", "b", 1, "x", Status::Needs),
+            pr("GitHub", "a", 2, "x", Status::Needs),
+            pr("Forgejo", "a", 9, "x", Status::Needs),
+            pr("GitHub", "a", 1, "x", Status::Needs),
         ];
         let got: Vec<_> = pick(&prs, false, None, Group::Repo)
-            .iter()
-            .map(|p| (p.short_repo().to_owned(), p.host, p.number))
+            .into_iter()
+            .map(|p| (p.repo, p.host, p.number))
             .collect();
-        assert_eq!(
-            got,
-            [
-                ("a".into(), Host::Forgejo, 9),
-                ("a".into(), Host::GitHub, 1),
-                ("a".into(), Host::GitHub, 2),
-                ("b".into(), Host::GitHub, 1),
-            ]
-        );
+        let want = [
+            ("a", "Forgejo", 9),
+            ("a", "GitHub", 1),
+            ("a", "GitHub", 2),
+            ("b", "GitHub", 1),
+        ]
+        .map(|(r, h, n)| (format!("acme/{r}"), h.to_owned(), n));
+        assert_eq!(got, want);
     }
 
     #[test]
     fn pick_sorts_by_author_first_when_grouped_by_user() {
         let prs = [
-            pr(Host::GitHub, "a", 1, "zed", Status::Needs),
-            pr(Host::GitHub, "b", 1, "amy", Status::Needs),
+            pr("GitHub", "a", 1, "zed", Status::Needs),
+            pr("GitHub", "b", 1, "amy", Status::Needs),
         ];
         let got: Vec<_> = pick(&prs, false, None, Group::User)
             .into_iter()
@@ -186,9 +184,9 @@ pub mod tests {
     #[test]
     fn pick_filters_mine_and_status() {
         let prs = [
-            pr(Host::GitHub, "a", 1, "me", Status::Approved),
-            pr(Host::GitHub, "a", 2, "me", Status::Needs),
-            pr(Host::GitHub, "a", 3, "you", Status::Approved),
+            pr("GitHub", "a", 1, "me", Status::Approved),
+            pr("GitHub", "a", 2, "me", Status::Needs),
+            pr("GitHub", "a", 3, "you", Status::Approved),
         ];
         let numbers = |mine, status| -> Vec<u64> {
             pick(&prs, mine, status, Group::Repo)
@@ -200,6 +198,36 @@ pub mod tests {
         assert_eq!(numbers(true, None), [1, 2]);
         assert_eq!(numbers(false, Some(Status::Approved)), [1, 3]);
         assert_eq!(numbers(true, Some(Status::Approved)), [1]);
+    }
+
+    #[test]
+    fn pick_keeps_one_copy_of_a_pr_that_two_sources_find() {
+        let mut copy = pr("GitHub", "a", 1, "x", Status::Needs);
+        copy.host = "Work GitHub".into();
+        let prs = [pr("GitHub", "a", 1, "x", Status::Needs), copy];
+        let hosts: Vec<_> = pick(&prs, false, None, Group::Repo)
+            .into_iter()
+            .map(|p| p.host)
+            .collect();
+        assert_eq!(hosts, ["GitHub"]);
+    }
+
+    #[test]
+    fn the_owner_is_left_out_only_when_every_pr_shares_it() {
+        let a = pr("GitHub", "acme/a", 1, "x", Status::Needs);
+        let b = pr("GitHub", "acme/b", 1, "x", Status::Needs);
+        let c = pr("GitHub", "other/c", 1, "x", Status::Needs);
+        assert_eq!(shared_owner([&a, &b]).as_deref(), Some("acme"));
+        assert_eq!(shared_owner([&a, &c]), None);
+        assert_eq!(shared_owner([]), None);
+        assert_eq!(a.repo_without(Some("acme")), "a");
+        assert_eq!(c.repo_without(Some("acme")), "other/c");
+        assert_eq!(a.repo_without(None), "acme/a");
+        // Only a whole owner comes off
+        assert_eq!(
+            pr("GitHub", "acme2/x", 1, "x", Status::Needs).repo_without(Some("acme")),
+            "acme2/x"
+        );
     }
 
     #[test]
