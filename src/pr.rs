@@ -19,6 +19,14 @@ impl Status {
         }
     }
 
+    /// For narrow tables.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Status::Changes => "changes",
+            _ => self.label(),
+        }
+    }
+
     pub fn color(self) -> Color {
         match self {
             Status::Approved => Color::Green,

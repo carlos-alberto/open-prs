@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -27,9 +28,10 @@ const COPIED_TIMEOUT: Duration = Duration::from_secs(5);
 const ERROR_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The keys in the footer, most useful first; it shows as many as fit.
-const FOOTER: [(&str, &str); 13] = [
+const FOOTER: [(&str, &str); 14] = [
     ("o", "Open"),
     ("/", "Filter"),
+    ("←→", "Columns"),
     ("c", "Checks"),
     ("w", "For you"),
     ("f", "Failing CI"),
@@ -46,8 +48,107 @@ const FOOTER: [(&str, &str); 13] = [
 /// The keys the footer always shows, at its end.
 const FOOTER_END: [(&str, &str); 2] = [("?", "Help"), ("q", "Quit")];
 
+/// The fewest columns the title gets before the table saves space.
+const TITLE_MIN: usize = 25;
+
+/// How the table saves space: none of it hides anything, as ← and → scroll to what doesn't fit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Fit {
+    host: bool,
+    spacing: u16,
+    /// "changes" for "changes requested"
+    short_status: bool,
+}
+
+impl Default for Fit {
+    fn default() -> Self {
+        Fit {
+            host: true,
+            spacing: 2,
+            short_status: false,
+        }
+    }
+}
+
+/// The table takes these in order while the title has less than `TITLE_MIN` columns.
+const FIT_STEPS: [fn(&mut Fit); 2] = [|f| f.spacing = 1, |f| f.short_status = true];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Col {
+    /// The repo, or the author when grouped by user
+    Group,
+    Host,
+    Number,
+    Status,
+    Ci,
+    Notes,
+    Author,
+    Comments,
+    Updated,
+    Title,
+}
+
+impl Col {
+    fn header(self, by_repo: bool) -> &'static str {
+        match self {
+            Col::Group if by_repo => "Repo",
+            Col::Group => "Author",
+            Col::Host => "Host",
+            Col::Number if by_repo => "#",
+            Col::Number => "PR",
+            Col::Status => "Status",
+            Col::Ci => "CI",
+            Col::Notes => "Notes",
+            Col::Author => "Author",
+            Col::Comments => "Comments",
+            Col::Updated => "Updated",
+            Col::Title => "Title",
+        }
+    }
+}
+
+/// The columns that always show, on the left: they say which PR a row is.
+const FROZEN: [Col; 2] = [Col::Group, Col::Number];
+
+impl Fit {
+    /// The columns that scroll, in order; the title is last and always shows.
+    fn scrolling(&self, by_repo: bool) -> Vec<Col> {
+        [
+            (self.host, Col::Host),
+            (true, Col::Status),
+            (true, Col::Ci),
+            (true, Col::Notes),
+            // Grouped by user, the author is the group
+            (by_repo, Col::Author),
+            (true, Col::Comments),
+            (true, Col::Updated),
+            (true, Col::Title),
+        ]
+        .into_iter()
+        .filter_map(|(show, col)| show.then_some(col))
+        .collect()
+    }
+}
+
+/// The table's cells, and the width of each column but the title.
+struct TableLayout {
+    headers: Vec<String>,
+    cells: Vec<Vec<Line<'static>>>,
+    widths: Vec<usize>,
+    spacing: u16,
+}
+
+impl TableLayout {
+    /// The columns left for the title in `width`.
+    fn title_room(&self, width: u16) -> usize {
+        let used =
+            self.widths.iter().sum::<usize>() + usize::from(self.spacing) * self.widths.len();
+        usize::from(width).saturating_sub(used)
+    }
+}
+
 /// Every key, for the help panel.
-const HELP: [(&str, &str); 17] = [
+const HELP: [(&str, &str); 18] = [
     ("enter, o", "Open the PR in the browser"),
     (
         "/",
@@ -66,6 +167,7 @@ const HELP: [(&str, &str); 17] = [
     ("g", "Group by repo or by author"),
     ("s", "Add, edit and delete sources"),
     ("↑ ↓ PgUp PgDn Home End", "Move the cursor"),
+    ("← →", "Scroll the columns; the first two stay"),
     ("?", "Show this help"),
     ("q, ctrl+c", "Quit"),
 ];
@@ -128,6 +230,8 @@ pub struct App {
     rows: Vec<Pr>,
     /// The owner every PR has, which the table leaves out
     owner: Option<String>,
+    /// How many of the columns that scroll are hidden on the left
+    scroll: usize,
     table: TableState,
     /// Where the table was last drawn, to map mouse clicks to rows
     table_area: Rect,
@@ -199,6 +303,7 @@ impl App {
             follow: false,
             rows: Vec::new(),
             owner: None,
+            scroll: 0,
             table: TableState::new(),
             table_area: Rect::default(),
             toasts: Vec::new(),
@@ -415,6 +520,8 @@ impl App {
             }
             KeyCode::Down => self.move_cursor(1),
             KeyCode::Up => self.move_cursor(-1),
+            KeyCode::Right => self.scroll_columns(1),
+            KeyCode::Left => self.scroll_columns(-1),
             KeyCode::PageDown => self.move_cursor(page as isize),
             KeyCode::PageUp => self.move_cursor(-(page as isize)),
             KeyCode::Home => self.move_cursor(isize::MIN),
@@ -516,6 +623,8 @@ impl App {
         match mouse.kind {
             MouseEventKind::ScrollDown => self.move_cursor(1),
             MouseEventKind::ScrollUp => self.move_cursor(-1),
+            MouseEventKind::ScrollRight => self.scroll_columns(1),
+            MouseEventKind::ScrollLeft => self.scroll_columns(-1),
             MouseEventKind::Down(MouseButton::Left) => {
                 let area = self.table_area;
                 // The first line of the table is its header
@@ -663,7 +772,7 @@ impl App {
         );
 
         self.table_area = body;
-        let table = self.table_widget(Utc::now());
+        let table = self.table_widget(Utc::now(), body.width);
         frame.render_stateful_widget(table, body, &mut self.table);
         let footer_line = match self.mode {
             Mode::Search => {
@@ -727,19 +836,84 @@ impl App {
         }
     }
 
-    fn table_widget(&self, now: DateTime<Utc>) -> Table<'static> {
+    /// The table, with as much as fits in `width`; see `FIT_STEPS`.
+    fn table_widget(&self, now: DateTime<Utc>, width: u16) -> Table<'static> {
+        let layout = self.fit(now, width);
+        let widths: Vec<Constraint> = layout
+            .widths
+            .iter()
+            .map(|w| Constraint::Length(*w as u16))
+            .chain([Constraint::Fill(1)])
+            .collect();
+        let rows = layout.cells.into_iter().zip(&self.rows).map(|(row, p)| {
+            let row = Row::new(row.into_iter().map(Cell::from));
+            // A draft isn't ready for review yet
+            if p.draft { row.dim() } else { row }
+        });
+        Table::new(rows, widths)
+            .header(Row::new(layout.headers).bold())
+            .column_spacing(layout.spacing)
+            .row_highlight_style(
+                Style::new()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
+    }
+
+    /// Takes the steps in `FIT_STEPS` until the title has `TITLE_MIN` columns, or there are
+    /// no more.
+    fn fit(&self, now: DateTime<Utc>, width: u16) -> TableLayout {
+        let mut fit = self.fit_start();
+        let mut layout = self.layout(&fit, now);
+        for step in FIT_STEPS {
+            if layout.title_room(width) >= TITLE_MIN {
+                break;
+            }
+            step(&mut fit);
+            layout = self.layout(&fit, now);
+        }
+        layout
+    }
+
+    fn fit_start(&self) -> Fit {
+        let hosts: HashSet<&str> = self.rows.iter().map(|p| p.host.as_str()).collect();
+        Fit {
+            // With one host, the column says nothing
+            host: hosts.len() > 1,
+            ..Fit::default()
+        }
+    }
+
+    /// How many columns → can hide, as the title always shows.
+    fn max_scroll(&self) -> usize {
+        self.fit_start().scrolling(self.group == Group::Repo).len() - 1
+    }
+
+    fn scroll_columns(&mut self, by: isize) {
+        self.scroll = self.scroll.saturating_add_signed(by).min(self.max_scroll());
+    }
+
+    fn layout(&self, fit: &Fit, now: DateTime<Utc>) -> TableLayout {
         let by_repo = self.group == Group::Repo;
-        let headers: &[&str] = if by_repo {
-            &[
-                "Repo", "Host", "#", "Status", "CI", "Notes", "Author", "Comments", "Updated",
-                "Title",
-            ]
-        } else {
-            &[
-                "Author", "Host", "PR", "Status", "CI", "Notes", "Comments", "Updated", "Title",
-            ]
-        };
         let owner = self.owner.as_deref();
+        let scrolling = fit.scrolling(by_repo);
+        let scroll = self.scroll.min(scrolling.len() - 1);
+        let cols: Vec<Col> = FROZEN
+            .into_iter()
+            .chain(scrolling[scroll..].iter().copied())
+            .collect();
+        let headers: Vec<String> = cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                // ‹ says columns are hidden to the left
+                if i == FROZEN.len() && scroll > 0 {
+                    format!("‹ {}", c.header(by_repo))
+                } else {
+                    c.header(by_repo).to_owned()
+                }
+            })
+            .collect();
 
         let mut cells: Vec<Vec<Line<'static>>> = Vec::with_capacity(self.rows.len());
         let mut last: Option<(&str, Option<&str>)> = None;
@@ -759,80 +933,66 @@ impl App {
             };
             last = Some(group);
 
-            let mut row = vec![Line::raw(label), Line::raw(p.host.clone()).dim()];
-            let status = Line::styled(p.status.label(), Style::new().fg(p.status.color()));
-            // Blank when the last commit has no checks
-            let ci = p.ci.map_or_else(Line::default, |ci| {
-                Line::styled(ci.label(), Style::new().fg(ci.color()))
-            });
-            // The tree shows what the PR is stacked on, when it can
-            let notes = Line::from(
-                p.notes()
-                    .into_iter()
-                    .filter(|note| !matches!(note, Note::On(_)) || p.tree.is_empty())
-                    .enumerate()
-                    .flat_map(|(i, note)| {
-                        let gap = Span::raw(if i == 0 { "" } else { " " });
-                        [gap, Span::styled(note.label(), note.style())]
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            if by_repo {
-                row.extend([
-                    Line::from(vec![
+            let row = cols
+                .iter()
+                .map(|col| match col {
+                    Col::Group => Line::raw(label.clone()),
+                    Col::Host => Line::raw(p.host.clone()).dim(),
+                    Col::Number if by_repo => Line::from(vec![
                         Span::styled(p.tree.clone(), Style::new().dim()),
                         Span::raw(format!("#{}", p.number)),
                     ]),
-                    status,
-                    ci,
-                    notes,
-                    Line::raw(p.author.clone()),
-                ]);
-            } else {
-                row.extend([
-                    Line::raw(format!("{}#{}", p.repo_without(owner), p.number)),
-                    status,
-                    ci,
-                    notes,
-                ]);
-            }
-            // Blank for none, so the PRs with comments stand out
-            let comments = match p.comments {
-                0 => Line::default(),
-                n => Line::raw(n.to_string()).right_aligned(),
-            };
-            row.extend([
-                comments,
-                Line::raw(age(p.updated, now)),
-                Line::raw(p.title.clone()),
-            ]);
+                    Col::Number => Line::raw(format!("{}#{}", p.repo_without(owner), p.number)),
+                    Col::Status => {
+                        let label = if fit.short_status {
+                            p.status.short_label()
+                        } else {
+                            p.status.label()
+                        };
+                        Line::styled(label, Style::new().fg(p.status.color()))
+                    }
+                    // Blank when the last commit has no checks
+                    Col::Ci => p.ci.map_or_else(Line::default, |ci| {
+                        Line::styled(ci.label(), Style::new().fg(ci.color()))
+                    }),
+                    // The tree shows what the PR is stacked on, when it can
+                    Col::Notes => Line::from(
+                        p.notes()
+                            .into_iter()
+                            .filter(|note| !matches!(note, Note::On(_)) || p.tree.is_empty())
+                            .enumerate()
+                            .flat_map(|(i, note)| {
+                                let gap = Span::raw(if i == 0 { "" } else { " " });
+                                [gap, Span::styled(note.label(), note.style())]
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    Col::Author => Line::raw(p.author.clone()),
+                    // Blank for none, so the PRs with comments stand out
+                    Col::Comments => match p.comments {
+                        0 => Line::default(),
+                        n => Line::raw(n.to_string()).right_aligned(),
+                    },
+                    Col::Updated => Line::raw(age(p.updated, now)),
+                    Col::Title => Line::raw(p.title.clone()),
+                })
+                .collect();
             cells.push(row);
         }
 
-        // Size each column to fit, and give the rest of the width to the title
-        let widths: Vec<Constraint> = (0..headers.len())
+        // Each column but the title is as wide as its widest cell or header
+        let widths = (0..cols.len() - 1)
             .map(|i| {
-                if i == headers.len() - 1 {
-                    return Constraint::Fill(1);
-                }
                 let widest = cells.iter().map(|row| row[i].width()).max().unwrap_or(0);
-                Constraint::Length(widest.max(headers[i].len()) as u16)
+                widest.max(Span::raw(headers[i].as_str()).width())
             })
             .collect();
-
-        let rows = cells.into_iter().zip(&self.rows).map(|(row, p)| {
-            let row = Row::new(row.into_iter().map(Cell::from));
-            // A draft isn't ready for review yet
-            if p.draft { row.dim() } else { row }
-        });
-        Table::new(rows, widths)
-            .header(Row::new(headers.iter().map(|h| Cell::from(*h))).bold())
-            .column_spacing(2)
-            .row_highlight_style(
-                Style::new()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )
+        TableLayout {
+            headers,
+            cells,
+            widths,
+            spacing: fit.spacing,
+        }
     }
 
     fn draw_toasts(&self, frame: &mut Frame, area: Rect) {
@@ -1145,13 +1305,16 @@ mod tests {
                 .collect()
         };
         // Forgejo's a and GitHub's a are separate groups
-        assert_eq!(first_column(&screen(&mut app, 80, 8)), ["a", "a", "", "b"]);
+        let lines = screen(&mut app, 120, 8);
+        assert_eq!(first_column(&lines), ["a", "a", "", "b"]);
+        // Two hosts, so the Host column shows
+        assert!(lines[1].starts_with("Repo  #   Host     Status"));
 
         // With a second owner, every repo shows its owner
         app.feeds[1].prs[0].repo = "other/a".into();
         app.show();
         assert_eq!(
-            first_column(&screen(&mut app, 80, 8)),
+            first_column(&screen(&mut app, 120, 8)),
             ["acme/a", "", "acme/b", "other/a"]
         );
     }
@@ -1259,19 +1422,25 @@ mod tests {
         );
         let lines = screen(&mut app, 130, 12);
         assert!(lines[0].contains("Open PRs — 3 PRs · by repo"));
-        assert!(lines[1].starts_with(
-            "Repo     Host    #      Status             CI       Notes             Author"
-        ));
-        assert!(lines[2].starts_with(
-            "billing  GitHub  #4012  needs review       failing  for you conflict  amy"
-        ));
-        assert!(lines[3].starts_with(
-            "         GitHub  #4018  approved           passed                     me"
-        ));
+        // Every PR is from one host, so there is no Host column
+        assert!(
+            lines[1].starts_with(
+                "Repo     #      Status             CI       Notes             Author"
+            )
+        );
+        assert!(
+            lines[2]
+                .starts_with("billing  #4012  needs review       failing  for you conflict  amy")
+        );
+        assert!(
+            lines[3]
+                .starts_with("         #4018  approved           passed                     me")
+        );
         // No checks leaves the CI cell blank
-        assert!(lines[4].starts_with(
-            "web      GitHub  #1207  changes requested           draft             zed"
-        ));
+        assert!(
+            lines[4]
+                .starts_with("web      #1207  changes requested           draft             zed")
+        );
         // Comments are right-aligned under their 8-wide header, and blank for none
         assert!(lines[1].contains("Author  Comments  Updated"));
         assert!(lines[2].contains(&format!("amy{}12  2965w", " ".repeat(11))));
@@ -1321,12 +1490,12 @@ mod tests {
         ];
         app.show();
         let lines = screen(&mut app, 110, 8);
-        // Repo is 4 wide and Host 6, with 2 between columns, so # starts at character 14
+        // Repo is 4 wide, with 2 before the next column, so # starts at character 6
         let numbers: Vec<String> = lines[2..6]
             .iter()
             .map(|l| {
                 l.chars()
-                    .skip(14)
+                    .skip(6)
                     .take(8)
                     .collect::<String>()
                     .trim_end()
@@ -1348,6 +1517,64 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("app#3") && l.contains("on #2"))
         );
+    }
+
+    #[test]
+    fn a_narrow_table_saves_space_then_scrolls_with_the_arrows() {
+        let (mut app, _rx) = app(Group::Repo, vec![github()]);
+        let mut p = pr("GitHub", "billing", 4012, "AlexandraNoble", Status::Changes);
+        p.title = "Show the new invoice page to the beta testers".into();
+        p.ci = Some(Ci::Passed);
+        app.feeds[0].prs = vec![p];
+        app.show();
+
+        // Wide: two spaces between columns, and the whole status
+        let wide = screen(&mut app, 140, 6);
+        assert!(wide[1].starts_with("Repo     #      Status             CI      Notes  Author"));
+        assert!(wide[2].contains("changes requested"));
+
+        // Narrow: one space between columns, and the short status, but every column stays
+        let narrow = screen(&mut app, 80, 6);
+        assert!(narrow[1].starts_with(
+            "Repo    #     Status  CI     Notes Author         Comments Updated Title"
+        ));
+        assert!(narrow[2].contains("changes "));
+        assert!(!narrow[2].contains("changes requested"));
+        assert!(!narrow[2].contains("Show the new invoice page to"));
+
+        // → hides Status, and the frozen Repo and # stay
+        app.on_key(key(KeyCode::Right));
+        let lines = screen(&mut app, 80, 6);
+        assert!(lines[1].starts_with("Repo    #     ‹ CI   Notes Author"));
+        assert!(!lines[2].contains("changes"));
+
+        // As far as it goes, only the title is left, with all its room
+        for _ in 0..20 {
+            app.on_key(key(KeyCode::Right));
+        }
+        assert_eq!(app.scroll, 6);
+        let lines = screen(&mut app, 80, 6);
+        assert!(lines[1].starts_with("Repo     #      ‹ Title"));
+        assert!(lines[2].contains("Show the new invoice page to the beta testers"));
+
+        // ← brings the columns back
+        for _ in 0..20 {
+            app.on_key(key(KeyCode::Left));
+        }
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn grouped_by_user_there_is_no_author_column_to_scroll() {
+        let (mut app, _rx) = app(Group::User, vec![github(), forgejo()]);
+        app.feeds[0].prs = vec![pr("GitHub", "a", 1, "x", Status::Needs)];
+        app.feeds[1].prs = vec![pr("Forgejo", "a", 1, "x", Status::Needs)];
+        app.show();
+        // Host, Status, CI, Notes, Comments, Updated hide; the title stays
+        assert_eq!(app.max_scroll(), 6);
+        app.group = Group::Repo;
+        app.show();
+        assert_eq!(app.max_scroll(), 7);
     }
 
     #[test]

@@ -27,10 +27,17 @@ while it runs, and `/` changes the words. It reloads every SECONDS (default 60) 
 | `g` | Group by repo or by author |
 | `s` | Add, edit and delete sources |
 | `↑` `↓` `PgUp` `PgDn` `Home` `End`, scroll | Move the cursor |
+| `←` `→`, sideways scroll | Scroll the columns; Repo and # stay |
 | `?` | Show every key |
 | `q`, `ctrl+c` | Quit |
 
 The footer shows as many keys as fit, and `?` shows them all.
+
+The Host column shows only when the PRs come from more than one host. When the title has
+less than 25 columns, the table puts one space between columns and shortens
+`changes requested` to `changes`. Nothing else hides: `→` scrolls the columns after `#` to
+the left, so the title gets their room, and `‹` shows that some are hidden. `←` brings them
+back.
 
 The CI column is `passed`, `failing` or `pending`, and blank when the last commit has no
 checks. The Notes column says when a PR asks for your review (`for you`, which on GitHub
