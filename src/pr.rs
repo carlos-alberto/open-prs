@@ -163,6 +163,8 @@ pub struct Filter {
     /// Only PRs with failing CI
     pub failing: bool,
     pub hide_drafts: bool,
+    /// Words that must all be in the PR's repo, number, title, author or host, in any case
+    pub text: String,
 }
 
 impl Filter {
@@ -172,6 +174,20 @@ impl Filter {
             && (p.requested || !self.for_you)
             && (p.ci == Some(Ci::Failing) || !self.failing)
             && !(p.draft && self.hide_drafts)
+            && self.matches_text(p)
+    }
+
+    fn matches_text(&self, p: &Pr) -> bool {
+        let mut words = self.text.split_whitespace().peekable();
+        if words.peek().is_none() {
+            return true;
+        }
+        let haystack = format!(
+            "{}#{} {} {} {}",
+            p.repo, p.number, p.title, p.author, p.host
+        )
+        .to_lowercase();
+        words.all(|word| haystack.contains(&word.to_lowercase()))
     }
 
     /// What it leaves out, for the subtitle.
@@ -191,6 +207,9 @@ impl Filter {
         }
         if self.hide_drafts {
             parts.push("no drafts".into());
+        }
+        if !self.text.trim().is_empty() {
+            parts.push(format!("matching \"{}\"", self.text.trim()));
         }
         parts
     }
@@ -370,6 +389,27 @@ pub mod tests {
             .describe(),
             ["mine", "for you", "failing CI", "no drafts"]
         );
+    }
+
+    #[test]
+    fn text_needs_every_word_somewhere_in_any_case() {
+        let mut prs = [1, 2, 3].map(|n| pr("GitHub", "billing", n, "amy", Status::Needs));
+        prs[0].title = "Fix the Login page".into();
+        prs[1].title = "Add a page".into();
+        prs[2].repo = "acme/web".into();
+        let text = |text: &str| Filter {
+            text: text.into(),
+            ..Filter::default()
+        };
+        assert_eq!(numbers(&prs, &text("")), [1, 2, 3]);
+        assert_eq!(numbers(&prs, &text("  ")), [1, 2, 3]);
+        assert_eq!(numbers(&prs, &text("PAGE")), [1, 2]);
+        assert_eq!(numbers(&prs, &text("page login")), [1]);
+        assert_eq!(numbers(&prs, &text("web")), [3]);
+        assert_eq!(numbers(&prs, &text("billing#2")), [2]);
+        assert_eq!(numbers(&prs, &text("amy github")), [1, 2, 3]);
+        assert_eq!(numbers(&prs, &text("page bob")), Vec::<u64>::new());
+        assert_eq!(text(" login ").describe(), ["matching \"login\""]);
     }
 
     #[test]

@@ -27,8 +27,9 @@ const COPIED_TIMEOUT: Duration = Duration::from_secs(5);
 const ERROR_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The keys in the footer, most useful first; it shows as many as fit.
-const FOOTER: [(&str, &str); 12] = [
+const FOOTER: [(&str, &str); 13] = [
     ("o", "Open"),
+    ("/", "Filter"),
     ("c", "Checks"),
     ("w", "For you"),
     ("f", "Failing CI"),
@@ -46,8 +47,13 @@ const FOOTER: [(&str, &str); 12] = [
 const FOOTER_END: [(&str, &str); 2] = [("?", "Help"), ("q", "Quit")];
 
 /// Every key, for the help panel.
-const HELP: [(&str, &str); 15] = [
+const HELP: [(&str, &str); 17] = [
     ("enter, o", "Open the PR in the browser"),
+    (
+        "/",
+        "Filter by words in the repo, number, title, author or host",
+    ),
+    ("esc", "Clear the words"),
     ("c", "Open the PR's CI runs"),
     ("y", "Copy the PR's URL"),
     ("r", "Reload now"),
@@ -92,6 +98,8 @@ enum State {
 
 enum Mode {
     Table,
+    /// Typing the words of the filter
+    Search,
     Help,
     Sources(List),
     Form(Form),
@@ -373,6 +381,7 @@ impl App {
             Mode::Table => self.on_table_key(key),
             Mode::Sources(list) => self.on_sources_key(list, key),
             Mode::Form(form) => self.on_form_key(form, key),
+            Mode::Search => self.on_search_key(key),
             // Any key closes the help
             Mode::Help => {}
         }
@@ -398,6 +407,11 @@ impl App {
             }
             KeyCode::Char('s') => self.mode = Mode::Sources(List::default()),
             KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('/') => self.mode = Mode::Search,
+            KeyCode::Esc if !self.filter.text.is_empty() => {
+                self.filter.text.clear();
+                self.show();
+            }
             KeyCode::Down => self.move_cursor(1),
             KeyCode::Up => self.move_cursor(-1),
             KeyCode::PageDown => self.move_cursor(page as isize),
@@ -406,6 +420,35 @@ impl App {
             KeyCode::End => self.move_cursor(isize::MAX),
             _ => {}
         }
+    }
+
+    /// The table follows each key, and enter keeps the words or esc clears them.
+    fn on_search_key(&mut self, key: KeyEvent) {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Enter => return,
+            KeyCode::Esc => {
+                self.filter.text.clear();
+                self.show();
+                return;
+            }
+            KeyCode::Up => self.move_cursor(-1),
+            KeyCode::Down => self.move_cursor(1),
+            KeyCode::Backspace => {
+                self.filter.text.pop();
+                self.show();
+            }
+            KeyCode::Char('u') if control => {
+                self.filter.text.clear();
+                self.show();
+            }
+            KeyCode::Char(c) if !control && !key.modifiers.contains(KeyModifiers::ALT) => {
+                self.filter.text.push(c);
+                self.show();
+            }
+            _ => {}
+        }
+        self.mode = Mode::Search;
     }
 
     fn on_sources_key(&mut self, mut list: List, key: KeyEvent) {
@@ -621,7 +664,19 @@ impl App {
         self.table_area = body;
         let table = self.table_widget(Utc::now());
         frame.render_stateful_widget(table, body, &mut self.table);
-        frame.render_widget(footer_keys(footer.width), footer);
+        let footer_line = match self.mode {
+            Mode::Search => {
+                let mut spans = vec![
+                    Span::styled(" / ", Style::new().bold().reversed()),
+                    Span::raw(format!(" {}", self.filter.text)),
+                    Span::raw("█   "),
+                ];
+                spans.extend(manage::keys(&[("enter", "Keep"), ("esc", "Clear")]).spans);
+                Line::from(spans)
+            }
+            _ => footer_keys(footer.width),
+        };
+        frame.render_widget(footer_line, footer);
 
         match &self.mode {
             Mode::Table => {}
@@ -630,6 +685,7 @@ impl App {
             }
             Mode::Form(form) => form.draw(frame, body),
             Mode::Help => draw_help(frame, body),
+            Mode::Search => {}
         }
         self.draw_toasts(frame, body);
     }
@@ -1214,9 +1270,9 @@ mod tests {
                 .map(|s| s.content.as_ref())
                 .collect()
         };
-        // c Checks needs 12 columns, and 10 are left
+        // / Filter needs 12 columns, and 10 are left
         assert_eq!(text(40), " o  Open   ?  Help   q  Quit  ");
-        assert_eq!(text(42), " o  Open   c  Checks   ?  Help   q  Quit  ");
+        assert_eq!(text(42), " o  Open   /  Filter   ?  Help   q  Quit  ");
         assert!(text(500).contains(" r  Reload  "));
         assert_eq!(text(5), " ?  Help   q  Quit  ");
     }
@@ -1228,6 +1284,43 @@ mod tests {
         let lines = screen(&mut app, 110, 30);
         assert!(lines.iter().any(|l| l.contains("Only PRs with failing CI")));
         app.on_key(key(KeyCode::Char('x')));
+        assert!(matches!(app.mode, Mode::Table));
+    }
+
+    #[test]
+    fn slash_filters_as_you_type_and_esc_clears() {
+        let (mut app, _rx) = app(Group::Repo, vec![github()]);
+        app.feeds[0].prs = [1, 2, 3]
+            .map(|n| pr("GitHub", "a", n, "x", Status::Needs))
+            .into();
+        app.feeds[0].prs[1].title = "Fix the login page".into();
+        app.show();
+        app.on_key(key(KeyCode::Char('/')));
+        // q types, and doesn't quit
+        for c in "login q".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        assert!(!app.quit);
+        assert!(app.rows.is_empty());
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(app.rows.len(), 1);
+        let lines = screen(&mut app, 100, 8);
+        assert!(lines[7].starts_with(" /  login █"));
+
+        // enter keeps the words
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.mode, Mode::Table));
+        assert_eq!(app.filter.text, "login ");
+        assert!(app.subtitle().contains("matching \"login\""));
+
+        // esc in the table clears them
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.rows.len(), 3);
+
+        app.on_key(key(KeyCode::Char('/')));
+        app.on_key(key(KeyCode::Char('x')));
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.filter.text.is_empty());
         assert!(matches!(app.mode, Mode::Table));
     }
 

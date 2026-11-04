@@ -4,17 +4,19 @@ Lists open PRs on GitHub, Forgejo and Gitea, with their review status and CI sta
 
 ```
 open_prs [-m/--mine] [-a/--approved | -n/--needs-review] [-w/--for-you] [-f/--failing]
-         [-d/--hide-drafts] [-g/--group repo|user] [-i/--interval SECONDS]
+         [-d/--hide-drafts] [--text WORDS] [-g/--group repo|user] [-i/--interval SECONDS]
          [--github QUERY]... [--forgejo LOGIN]...
 ```
 
 The flags set how the TUI starts. The keys `m`, `a`, `n`, `w`, `f`, `d` and `g` toggle them
-while it runs. It reloads every SECONDS (default 60) and keeps the cursor on the same PR.
+while it runs, and `/` changes the words. It reloads every SECONDS (default 60) and keeps the cursor on the same PR.
 
 | Key | Action |
 |-----|--------|
 | `enter`, `o`, click the cursor row | Open the PR in the browser |
 | `c` | Open the PR's CI runs |
+| `/` | Filter by words in the repo, number, title, author or host; `enter` keeps them, `esc` clears them |
+| `esc` | Clear the words |
 | `y` | Copy the PR's URL |
 | `r` | Reload now |
 | `m` | Only PRs you opened |

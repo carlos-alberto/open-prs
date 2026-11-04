@@ -34,7 +34,8 @@ use crate::pr::{Ci, Filter, Group, Note, Status, pick};
                   ($XDG_CONFIG_HOME/open_prs/config.toml, else ~/.config/open_prs/config.toml). \
                   With neither, it searches github.com for involves:@me.\n\
                   Keys: enter/o open the PR in the browser, y copy its URL, r reload now, \
-                  m/a/n/w/f/d/g toggle the flags, s add, edit and delete sources, q quit.\n\
+                  m/a/n/w/f/d/g toggle the flags, / changes the words, s add, edit and delete \
+                  sources, ? every key, q quit.\n\
                   When stdout isn't a terminal, it prints one tab-separated line per PR: \
                   host, repo, number, status, author, title, url, ci (passed, failing, pending \
                   or empty), notes (for you, draft and conflict, with commas between)."
@@ -58,6 +59,9 @@ struct Args {
     /// Leave out draft PRs
     #[arg(short = 'd', long)]
     hide_drafts: bool,
+    /// Only PRs with all these words in the repo, number, title, author or host
+    #[arg(long, value_name = "WORDS", default_value = "")]
+    text: String,
     /// Group by repo or author
     #[arg(short, long, value_enum, default_value_t = Group::Repo)]
     group: Group,
@@ -87,6 +91,7 @@ fn main() -> ExitCode {
         for_you: args.for_you,
         failing: args.failing,
         hide_drafts: args.hide_drafts,
+        text: args.text,
     };
     let (sources, origin) = match config::load(&args.github, &args.forgejo) {
         Ok(loaded) => loaded,
