@@ -13,8 +13,8 @@ status and comments, and shows which PRs are stacked on which.
 - `p` previews a PR: its description, the checks that didn't pass, the files and the last
   comments
 - `v` asks people or teams to review a PR, or stops asking them
-- Desktop notifications when a PR asks for your review, and when one of yours gets approved,
-  gets changes requested or starts to fail CI
+- Desktop notifications, if you turn them on with `b`: when a PR asks for your review, and
+  when one of yours gets approved, gets changes requested or starts to fail CI
 - Stacked PRs show as a tree under the PR they are on
 - Filters for your PRs, approved PRs, PRs that need review, review requests, new PRs,
   failing CI and drafts, and a text filter
@@ -42,7 +42,8 @@ This puts `open_prs` in `~/.cargo/bin`. It needs:
 ```
 open_prs [-m/--mine] [-a/--approved | -n/--needs-review] [-w/--for-you] [-u/--new]
          [-f/--failing] [-d/--hide-drafts] [--text WORDS] [-g/--group repo|user]
-         [-i/--interval SECONDS] [--no-notify] [--github QUERY]... [--forgejo LOGIN]...
+         [-i/--interval SECONDS] [--notify | --no-notify] [--github QUERY]...
+         [--forgejo LOGIN]...
 ```
 
 With no sources, it shows the PRs on github.com that involve you. The flags set how the TUI
@@ -68,6 +69,7 @@ changes the words. It reloads every SECONDS (default 60).
 | `g` | Group by repo or by author |
 | `s` | Add, edit and delete sources |
 | `space` | Mark the PR as seen, or as new again |
+| `b` | Turn desktop notifications on or off |
 | `↑` `↓` `PgUp` `PgDn` `Home` `End`, scroll | Move the cursor |
 | `←` `→`, sideways scroll | Scroll the columns; Repo and # stay |
 | `?` | Show every key |
@@ -125,6 +127,12 @@ brings them back.
 
 ## Notifications
 
+Notifications are off until you turn them on. `b` turns them on or off, and the header says
+`notifications on` while they are. When the sources come from the config file, `b` saves
+`notify = true` or `notify = false` in it, so the next run does the same. `--notify` and
+`--no-notify` turn them on or off for one run, whatever the file says. When `b` turns them
+on, it sends one, so you can see that they work.
+
 After the first load of each source, each reload sends a desktop notification when a PR
 starts to ask for your review, and when one of your PRs gets approved, gets changes
 requested, or starts to fail CI. One reload sends three at most: when more PRs changed, the
@@ -133,7 +141,6 @@ third says how many. A PR that two sources find sends one.
 On macOS it uses `osascript`, so the notifications come from Script Editor; if none show,
 allow notifications for Script Editor in System Settings. On Linux it uses `notify-send`.
 Without either, it asks the terminal to show one (OSC 9), which some terminals do.
-`--no-notify` turns them off.
 
 ## Preview
 
@@ -176,6 +183,8 @@ Each source is a GitHub search or a tea login. They come from, in order:
 3. Neither: one GitHub search for `involves:@me`.
 
 ```toml
+notify = true                  # desktop notifications; b sets it; default false
+
 [[source]]
 kind = "github"
 query = "org:rust-lang"        # GitHub search qualifiers; default involves:@me

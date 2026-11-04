@@ -42,7 +42,7 @@ use crate::seen::Seen;
                   y copy its URL, \
                   r reload now, \
                   m/a/n/w/u/f/d/g toggle the flags, / changes the words, space marks the PR \
-                  as seen, s add, edit and delete sources, ? every key, q quit.\n\
+                  as seen, b turns notifications on or off, s add, edit and delete sources, ? every key, q quit.\n\
                   A PR is new when it changed since you last opened or previewed it; \
                   $XDG_STATE_HOME/open_prs/seen.json, else ~/.local/state/open_prs/seen.json, \
                   keeps when that was.\n\
@@ -80,8 +80,11 @@ struct Args {
     /// Group by repo or author
     #[arg(short, long, value_enum, default_value_t = Group::Repo)]
     group: Group,
-    /// Don't send desktop notifications
-    #[arg(long)]
+    /// Send desktop notifications, as `notify = true` in the config file and b in the TUI do
+    #[arg(long, overrides_with = "no_notify")]
+    notify: bool,
+    /// Don't send desktop notifications, whatever the config file says
+    #[arg(long, overrides_with = "notify")]
     no_notify: bool,
     /// Seconds between reloads
     #[arg(short, long, value_name = "SECONDS", default_value_t = 60,
@@ -112,8 +115,8 @@ fn main() -> ExitCode {
         hide_drafts: args.hide_drafts,
         text: args.text,
     };
-    let (sources, origin) = match config::load(&args.github, &args.forgejo) {
-        Ok(loaded) => loaded,
+    let config = match config::load(&args.github, &args.forgejo) {
+        Ok(config) => config,
         Err(e) => {
             eprintln!("open_prs: {e:#}");
             return ExitCode::from(2);
@@ -129,15 +132,15 @@ fn main() -> ExitCode {
     };
 
     if !io::stdout().is_terminal() {
-        return plain(&sources, &filter, args.group, &seen);
+        return plain(&config.sources, &filter, args.group, &seen);
     }
     let options = app::Options {
         filter,
         group: args.group,
         interval: Duration::from_secs(args.interval),
-        notify: !args.no_notify,
+        notify: !args.no_notify && (args.notify || config.notify),
     };
-    match app::run(options, sources, origin, seen) {
+    match app::run(options, config.sources, config.origin, seen) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("open_prs: {e:#}");

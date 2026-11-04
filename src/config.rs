@@ -109,9 +109,20 @@ pub enum Change {
     Remove(usize),
 }
 
+/// What the flags or the config file set.
+#[derive(Debug)]
+pub struct Config {
+    pub sources: Vec<Source>,
+    pub origin: Origin,
+    /// Send desktop notifications; `notify = true` in the file
+    pub notify: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
+    #[serde(default)]
+    notify: bool,
     #[serde(default)]
     source: Vec<Entry>,
 }
@@ -141,30 +152,50 @@ pub fn path() -> Option<PathBuf> {
     Some(base.join("open_prs").join("config.toml"))
 }
 
-/// The sources to load. The flags replace the config file, and with neither, it searches
-/// github.com for `involves:@me`.
-pub fn load(github: &[String], forgejo: &[String]) -> Result<(Vec<Source>, Origin)> {
+/// The sources to load, and the settings. The flags replace the config file, and with
+/// neither, it searches github.com for `involves:@me`.
+pub fn load(github: &[String], forgejo: &[String]) -> Result<Config> {
+    let config = |sources, origin, notify| Config {
+        sources,
+        origin,
+        notify,
+    };
     if !github.is_empty() || !forgejo.is_empty() {
         let github = github.iter().map(|q| Source::github(q, None, None));
         let forgejo = forgejo.iter().map(|l| Source::forgejo(l, None, None));
-        return Ok((github.chain(forgejo).collect(), Origin::Flags));
+        return Ok(config(
+            github.chain(forgejo).collect(),
+            Origin::Flags,
+            false,
+        ));
     }
     let default = || vec![Source::github(DEFAULT_QUERY, None, None)];
     let Some(path) = path() else {
-        return Ok((default(), Origin::Nowhere));
+        return Ok(config(default(), Origin::Nowhere, false));
     };
     match fs::read_to_string(&path) {
         Ok(text) => {
-            let sources = parse(&text).with_context(|| format!("{}", path.display()))?;
-            Ok((sources, Origin::File(path)))
+            let file = read(&text).with_context(|| format!("{}", path.display()))?;
+            let notify = file.notify;
+            let sources = sources(file).with_context(|| format!("{}", path.display()))?;
+            Ok(config(sources, Origin::File(path), notify))
         }
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok((default(), Origin::File(path))),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            Ok(config(default(), Origin::File(path), false))
+        }
         Err(e) => Err(e).with_context(|| format!("could not read {}", path.display())),
     }
 }
 
+fn read(text: &str) -> Result<File> {
+    Ok(toml::from_str(text)?)
+}
+
 fn parse(text: &str) -> Result<Vec<Source>> {
-    let file: File = toml::from_str(text)?;
+    sources(read(text)?)
+}
+
+fn sources(file: File) -> Result<Vec<Source>> {
     if file.source.is_empty() {
         bail!("there is no [[source]] in the file");
     }
@@ -185,14 +216,7 @@ fn parse(text: &str) -> Result<Vec<Source>> {
 /// Makes `change` to the `[[source]]` tables in the file at `path`, which must still hold
 /// `current`. It edits the tables in place, so the comments in the file stay.
 pub fn save(path: &Path, current: &[Source], change: &Change) -> Result<()> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e).with_context(|| format!("could not read {}", path.display())),
-    };
-    let mut doc: DocumentMut = text
-        .parse()
-        .with_context(|| format!("{}", path.display()))?;
+    let (text, mut doc) = open(path)?;
     let new_file = text.trim().is_empty();
     // Don't write over changes made in an editor since open_prs read the file
     if !new_file && parse(&text).ok().as_deref() != Some(current) {
@@ -222,7 +246,48 @@ pub fn save(path: &Path, current: &[Source], change: &Change) -> Result<()> {
         }
         Change::Remove(_) => bail!("no such source"),
     }
+    write_file(path, &doc)
+}
 
+/// Sets `notify` in the file at `path`, and keeps the rest. A new file gets the sources in
+/// `current` too, as a file needs one.
+pub fn save_notify(path: &Path, current: &[Source], on: bool) -> Result<()> {
+    let (text, mut doc) = open(path)?;
+    if text.trim().is_empty() {
+        let mut tables = ArrayOfTables::new();
+        for source in current {
+            tables.push(table(source));
+        }
+        doc.insert("source", Item::ArrayOfTables(tables));
+    }
+    match doc.get_mut("notify").and_then(Item::as_value_mut) {
+        // A changed value keeps the comment after it
+        Some(value) => {
+            let decor = value.decor().clone();
+            *value = on.into();
+            *value.decor_mut() = decor;
+        }
+        None => {
+            doc.insert("notify", toml_edit::value(on));
+        }
+    }
+    write_file(path, &doc)
+}
+
+/// The file's text and document; empty when there is no file.
+fn open(path: &Path) -> Result<(String, DocumentMut)> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("could not read {}", path.display())),
+    };
+    let doc = text
+        .parse()
+        .with_context(|| format!("{}", path.display()))?;
+    Ok((text, doc))
+}
+
+fn write_file(path: &Path, doc: &DocumentMut) -> Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).with_context(|| format!("could not make {}", dir.display()))?;
     }
@@ -350,15 +415,56 @@ mod tests {
 
     #[test]
     fn flags_replace_the_file() {
-        let (sources, origin) = load(&["org:a".into()], &["work".into()]).unwrap();
+        let config = load(&["org:a".into()], &["work".into()]).unwrap();
         assert_eq!(
-            sources,
+            config.sources,
             [
                 Source::github("org:a", None, None),
                 Source::forgejo("work", None, None)
             ]
         );
-        assert_eq!(origin, Origin::Flags);
+        assert_eq!(config.origin, Origin::Flags);
+        assert!(!config.notify);
+    }
+
+    #[test]
+    fn save_notify_sets_the_key_and_keeps_the_rest() {
+        let file = TempFile::new("notify", Some(FILE));
+        let current = parse(FILE).unwrap();
+        assert!(
+            !read(FILE).unwrap().notify,
+            "notifications are off by default"
+        );
+
+        save_notify(&file.0, &current, true).unwrap();
+        let text = file.read();
+        assert!(text.starts_with("notify = true\n"), "{text}");
+        assert!(text.contains("# My sources") && text.contains("query = \"org:acme\"  # work"));
+        assert!(read(&text).unwrap().notify);
+        assert_eq!(parse(&text).unwrap(), current);
+
+        // Off again, with the comment after it
+        fs::write(
+            &file.0,
+            text.replace("notify = true", "notify = true  # on"),
+        )
+        .unwrap();
+        save_notify(&file.0, &current, false).unwrap();
+        assert!(
+            file.read().starts_with("notify = false  # on\n"),
+            "{}",
+            file.read()
+        );
+    }
+
+    #[test]
+    fn save_notify_writes_the_sources_into_a_new_file() {
+        let file = TempFile::new("notify-new", None);
+        let current = vec![Source::github(DEFAULT_QUERY, None, None)];
+        save_notify(&file.0, &current, true).unwrap();
+        let text = file.read();
+        assert!(read(&text).unwrap().notify);
+        assert_eq!(parse(&text).unwrap(), current);
     }
 
     /// A config file in its own temporary folder, removed when the test ends.

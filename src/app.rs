@@ -32,7 +32,7 @@ const COPIED_TIMEOUT: Duration = Duration::from_secs(5);
 const ERROR_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The keys in the footer, most useful first; it shows as many as fit.
-const FOOTER: [(&str, &str); 18] = [
+const FOOTER: [(&str, &str); 19] = [
     ("o", "Open"),
     ("p", "Preview"),
     ("/", "Filter"),
@@ -49,6 +49,7 @@ const FOOTER: [(&str, &str); 18] = [
     ("d", "Drafts"),
     ("g", "Group"),
     ("space", "Seen"),
+    ("b", "Notify"),
     ("y", "Copy URL"),
     ("r", "Reload"),
 ];
@@ -156,7 +157,7 @@ impl TableLayout {
 }
 
 /// Every key, for the help panel.
-const HELP: [(&str, &str); 22] = [
+const HELP: [(&str, &str); 23] = [
     (
         "enter, o",
         "Open the PR in the browser, and mark it as seen",
@@ -184,6 +185,10 @@ const HELP: [(&str, &str); 22] = [
     ("g", "Group by repo or by author"),
     ("s", "Add, edit and delete sources"),
     ("space", "Mark the PR as seen, or as new again"),
+    (
+        "b",
+        "Turn desktop notifications on or off, in the config file too",
+    ),
     ("↑ ↓ PgUp PgDn Home End", "Move the cursor"),
     ("← →", "Scroll the columns; the first two stay"),
     ("?", "Show this help"),
@@ -298,8 +303,10 @@ pub struct App {
     load_reviewers: fn(&Source, &Pr, &[String]) -> Result<Reviewers>,
     /// Changes who a PR asks for a review
     save_reviewers: fn(&Source, &Pr, &reviewers::Change) -> Result<()>,
-    /// Sends a desktop notification, or None not to; the tests replace it
-    notifier: Option<fn(&Notice)>,
+    /// Send desktop notifications; b turns them on and off
+    notifications: bool,
+    /// Sends a desktop notification; the tests replace it
+    notifier: fn(&Notice),
     /// The tea logins for the form's hint
     logins: fn() -> Vec<String>,
 }
@@ -388,7 +395,8 @@ impl App {
             load_preview: sources::preview,
             load_reviewers: sources::reviewers,
             save_reviewers: sources::request_reviews,
-            notifier: options.notify.then_some(notify::send as fn(&Notice)),
+            notifications: options.notify,
+            notifier: notify::send,
             // Without tea, the form shows no hint
             logins: || sources::tea_logins().unwrap_or_default(),
         }
@@ -499,9 +507,9 @@ impl App {
     /// Sends each notice, but not for a PR that an earlier source found too, as that source
     /// sends it.
     fn announce(&self, id: u64, notices: Vec<Notice>) {
-        let Some(send) = self.notifier else {
+        if !self.notifications {
             return;
-        };
+        }
         let earlier: HashSet<&str> = self
             .feeds
             .iter()
@@ -510,7 +518,42 @@ impl App {
             .map(|p| p.url.as_str())
             .collect();
         for notice in notices.iter().filter(|n| !earlier.contains(n.url.as_str())) {
-            send(notice);
+            (self.notifier)(notice);
+        }
+    }
+
+    /// Turns notifications on or off, and saves that when the sources came from the config
+    /// file. Turning them on sends one, to show that they work.
+    fn toggle_notify(&mut self) {
+        self.notifications = !self.notifications;
+        let title = if self.notifications {
+            "Notifications on"
+        } else {
+            "Notifications off"
+        };
+        let saved = match &self.origin {
+            Origin::File(path) => {
+                let current: Vec<Source> = self.feeds.iter().map(|f| f.source.clone()).collect();
+                config::save_notify(path, &current, self.notifications)
+                    .map(|()| format!("Saved in {}", tilde(&path.display().to_string())))
+                    .map_err(|e| format!("{e:#}"))
+            }
+            Origin::Flags => Ok("Until you quit, as the sources come from the flags".into()),
+            Origin::Nowhere => Ok("Until you quit, as there is no home folder".into()),
+        };
+        match saved {
+            Ok(message) => self.notify(title.into(), message, false, COPIED_TIMEOUT),
+            Err(error) => {
+                let message = format!("Until you quit, as it could not save: {error}");
+                self.notify(title.into(), message, true, ERROR_TIMEOUT);
+            }
+        }
+        if self.notifications {
+            (self.notifier)(&Notice {
+                title: "open_prs".into(),
+                body: "Notifications are on".into(),
+                url: String::new(),
+            });
         }
     }
 
@@ -685,6 +728,7 @@ impl App {
             KeyCode::Char('w') => self.toggle(|f| &mut f.for_you),
             KeyCode::Char('u') => self.toggle(|f| &mut f.new),
             KeyCode::Char(' ') => self.see(true),
+            KeyCode::Char('b') => self.toggle_notify(),
             KeyCode::Char('f') => self.toggle(|f| &mut f.failing),
             KeyCode::Char('d') => self.toggle(|f| &mut f.hide_drafts),
             KeyCode::Char('g') => {
@@ -1104,6 +1148,9 @@ impl App {
             new => format!("{} PRs, {new} new", self.rows.len()),
         };
         let mut parts = vec![count, format!("by {}", self.group.name())];
+        if self.notifications {
+            parts.push("notifications on".into());
+        }
         parts.extend(self.filter.describe());
         let mut loading: Vec<_> = self
             .feeds
@@ -1869,7 +1916,8 @@ mod tests {
     #[test]
     fn a_reload_notifies_what_changed_once_per_pr() {
         let (mut app, _rx) = app(Group::Repo, vec![github(), forgejo()]);
-        app.notifier = Some(|n| SENT.with(|s| s.borrow_mut().push(n.title.clone())));
+        app.notifications = true;
+        app.notifier = |n| SENT.with(|s| s.borrow_mut().push(n.title.clone()));
         // The first loads say nothing, and the second source finds the same PR
         let mine = pr("GitHub", "a", 1, "me", Status::Needs);
         app.loaded(0, Ok(vec![mine.clone()]));
@@ -1879,6 +1927,29 @@ mod tests {
         app.loaded(0, Ok(vec![approved.clone()]));
         app.loaded(1, Ok(vec![approved]));
         SENT.with(|s| assert_eq!(*s.borrow(), ["Approved"]));
+    }
+
+    #[test]
+    fn b_turns_notifications_on_and_off() {
+        let (mut app, _rx) = app(Group::Repo, vec![github()]);
+        app.notifier = |n| SENT.with(|s| s.borrow_mut().push(n.body.clone()));
+        assert!(!app.notifications, "off unless something turns them on");
+        app.on_key(key(KeyCode::Char('b')));
+        assert!(app.notifications);
+        assert!(app.subtitle().contains(" · notifications on"));
+        assert_eq!(app.toasts[0].title, "Notifications on");
+        assert_eq!(
+            app.toasts[0].message,
+            "Until you quit, as the sources come from the flags"
+        );
+        // Turning them on sends one, to show they work
+        SENT.with(|s| assert_eq!(*s.borrow(), ["Notifications are on"]));
+
+        app.on_key(key(KeyCode::Char('b')));
+        assert!(!app.notifications);
+        assert!(!app.subtitle().contains("notifications"));
+        assert_eq!(app.toasts[1].title, "Notifications off");
+        SENT.with(|s| assert_eq!(s.borrow().len(), 1));
     }
 
     #[test]
