@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::config::{Kind, Source};
-use crate::pr::{Pr, Status};
+use crate::pr::{Ci, Pr, Status};
 
 pub fn fetch(source: &Source) -> Result<Vec<Pr>> {
     match &source.kind {
@@ -63,6 +63,7 @@ query($q: String!, $endCursor: String) {
       author { login }
       repository { nameWithOwner }
       latestOpinionatedReviews(first: 20) { nodes { state } }
+      commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
     } }
   }
 }";
@@ -99,6 +100,24 @@ struct GhPr {
     author: Option<GhLogin>,
     repository: GhRepo,
     latest_opinionated_reviews: GhReviews,
+    commits: GhCommits,
+}
+
+#[derive(Deserialize)]
+struct GhCommits {
+    nodes: Vec<GhCommitNode>,
+}
+
+#[derive(Deserialize)]
+struct GhCommitNode {
+    commit: GhCommit,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhCommit {
+    /// null when the commit has no checks or statuses
+    status_check_rollup: Option<GhState>,
 }
 
 #[derive(Deserialize)]
@@ -109,11 +128,11 @@ struct GhRepo {
 
 #[derive(Deserialize)]
 struct GhReviews {
-    nodes: Vec<GhReview>,
+    nodes: Vec<GhState>,
 }
 
 #[derive(Deserialize)]
-struct GhReview {
+struct GhState {
     state: String,
 }
 
@@ -149,6 +168,12 @@ fn parse_github(name: &str, out: &str) -> Result<Vec<Pr>> {
                     .map(String::from)
             });
             let author = n.author.map_or_else(|| "ghost".into(), |a| a.login);
+            let rollup = n
+                .commits
+                .nodes
+                .into_iter()
+                .next()
+                .and_then(|c| c.commit.status_check_rollup);
             prs.push(Pr {
                 host: name.into(),
                 repo: n.repository.name_with_owner,
@@ -162,11 +187,21 @@ fn parse_github(name: &str, out: &str) -> Result<Vec<Pr>> {
                     Some("CHANGES_REQUESTED") => Status::Changes,
                     _ => Status::Needs,
                 },
+                ci: rollup.and_then(|r| github_ci(&r.state)),
                 updated: n.updated_at,
             });
         }
     }
     Ok(prs)
+}
+
+fn github_ci(state: &str) -> Option<Ci> {
+    match state {
+        "SUCCESS" => Some(Ci::Passed),
+        "FAILURE" | "ERROR" => Some(Ci::Failing),
+        "PENDING" | "EXPECTED" => Some(Ci::Pending),
+        _ => None,
+    }
 }
 
 fn tea<T: DeserializeOwned + Default>(login: &str, args: &[&str]) -> Result<T> {
@@ -202,6 +237,14 @@ struct TeaIssue {
 struct TeaPull {
     #[serde(default)]
     reviews: Option<Vec<TeaReview>>,
+}
+
+#[derive(Deserialize)]
+struct TeaPullCi {
+    index: String,
+    /// The combined commit status, or empty without one
+    #[serde(default)]
+    ci: String,
 }
 
 #[derive(Deserialize)]
@@ -265,13 +308,74 @@ fn forgejo(name: &str, login: &str, owner: Option<&str>) -> Result<Vec<Pr>> {
             url: pr.url.clone(),
             author: pr.author_id.clone(),
             status: forgejo_status(pull.reviews.unwrap_or_default()),
+            ci: None,
             updated: pr.updated,
             mine: pr.author_id == me,
         })
     };
 
-    // One tea call per PR, so run them side by side
-    par_map(&listed, 8, status).into_iter().collect()
+    // One tea call per PR for its reviews and one per repo for CI, all side by side
+    let repos: Vec<String> = listed
+        .iter()
+        .map(|pr| format!("{}/{}", pr.owner, pr.repo))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let (ci, prs) = thread::scope(|s| {
+        let ci = s.spawn(|| par_map(&repos, 4, |repo| forgejo_ci(login, repo)));
+        let prs = par_map(&listed, 8, status);
+        (ci.join().unwrap(), prs)
+    });
+    let ci: HashMap<&str, HashMap<String, Option<Ci>>> = repos
+        .iter()
+        .map(String::as_str)
+        .zip(ci.into_iter().collect::<Result<Vec<_>>>()?)
+        .collect();
+    let mut prs = prs.into_iter().collect::<Result<Vec<_>>>()?;
+    for pr in &mut prs {
+        pr.ci = ci
+            .get(pr.repo.as_str())
+            .and_then(|by_number| by_number.get(&pr.number.to_string()))
+            .copied()
+            .flatten();
+    }
+    Ok(prs)
+}
+
+/// The CI state of each open PR in `repo`, by number. tea gives it in a repo's list of PRs,
+/// so this is one call per repo, not per PR.
+fn forgejo_ci(login: &str, repo: &str) -> Result<HashMap<String, Option<Ci>>> {
+    let mut ci = HashMap::new();
+    for page in 1.. {
+        let page = page.to_string();
+        let batch: Vec<TeaPullCi> = tea(
+            login,
+            &[
+                "pulls", "list", "--repo", repo, "--state", "open", "--limit", "50", "--page",
+                &page, "--fields", "index,ci",
+            ],
+        )?;
+        let last = batch.len() < 50;
+        ci.extend(
+            batch
+                .into_iter()
+                .map(|p| (p.index, forgejo_ci_state(&p.ci))),
+        );
+        if last {
+            break;
+        }
+    }
+    Ok(ci)
+}
+
+fn forgejo_ci_state(state: &str) -> Option<Ci> {
+    match state {
+        "success" => Some(Ci::Passed),
+        // Gitea ranks a warning between a failure and pending, so it needs a look too
+        "failure" | "error" | "warning" => Some(Ci::Failing),
+        "pending" => Some(Ci::Pending),
+        _ => None,
+    }
 }
 
 /// The latest verdict per reviewer: any change request wins, then any approval.
@@ -383,8 +487,13 @@ mod tests {
             )
         };
         let node = |number: u64, decision: &str, author: &str, reviews: &str| {
+            let commits = match number {
+                1 => r#"{"commit":{"statusCheckRollup":{"state":"FAILURE"}}}"#,
+                2 => r#"{"commit":{"statusCheckRollup":null}}"#,
+                _ => "",
+            };
             format!(
-                r#"{{"number":{number},"title":"t","url":"u{number}","reviewDecision":{decision},"updatedAt":"2026-11-04T09:07:15Z","author":{author},"repository":{{"nameWithOwner":"acme/r"}},"latestOpinionatedReviews":{{"nodes":[{reviews}]}}}}"#
+                r#"{{"number":{number},"title":"t","url":"u{number}","reviewDecision":{decision},"updatedAt":"2026-11-04T09:07:15Z","author":{author},"repository":{{"nameWithOwner":"acme/r"}},"latestOpinionatedReviews":{{"nodes":[{reviews}]}},"commits":{{"nodes":[{commits}]}}}}"#
             )
         };
         let out = format!(
@@ -418,14 +527,47 @@ mod tests {
         let prs = parse_github("GitHub", &out).unwrap();
         let got: Vec<_> = prs
             .iter()
-            .map(|p| (p.number, p.status, p.author.as_str(), p.mine))
+            .map(|p| (p.number, p.status, p.ci, p.author.as_str(), p.mine))
             .collect();
         assert_eq!(
             got,
             [
-                (1, Status::Approved, "me", true),
-                (2, Status::Changes, "ghost", false),
-                (3, Status::Needs, "you", false),
+                (1, Status::Approved, Some(Ci::Failing), "me", true),
+                (2, Status::Changes, None, "ghost", false),
+                (3, Status::Needs, None, "you", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn ci_states_map_to_passed_failing_and_pending() {
+        let github: Vec<_> = ["SUCCESS", "FAILURE", "ERROR", "PENDING", "EXPECTED", "NEW"]
+            .map(github_ci)
+            .into();
+        let forgejo: Vec<_> = ["success", "failure", "error", "warning", "pending", ""]
+            .map(forgejo_ci_state)
+            .into();
+        use Ci::*;
+        assert_eq!(
+            github,
+            [
+                Some(Passed),
+                Some(Failing),
+                Some(Failing),
+                Some(Pending),
+                Some(Pending),
+                None
+            ]
+        );
+        assert_eq!(
+            forgejo,
+            [
+                Some(Passed),
+                Some(Failing),
+                Some(Failing),
+                Some(Failing),
+                Some(Pending),
+                None
             ]
         );
     }

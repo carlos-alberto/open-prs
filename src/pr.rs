@@ -28,6 +28,32 @@ impl Status {
     }
 }
 
+/// The combined state of the checks on a PR's last commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ci {
+    Passed,
+    Failing,
+    Pending,
+}
+
+impl Ci {
+    pub fn label(self) -> &'static str {
+        match self {
+            Ci::Passed => "passed",
+            Ci::Failing => "failing",
+            Ci::Pending => "pending",
+        }
+    }
+
+    pub fn color(self) -> Color {
+        match self {
+            Ci::Passed => Color::Green,
+            Ci::Failing => Color::Red,
+            Ci::Pending => Color::Yellow,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Group {
     Repo,
@@ -61,6 +87,8 @@ pub struct Pr {
     pub url: String,
     pub author: String,
     pub status: Status,
+    /// None when the last commit has no checks
+    pub ci: Option<Ci>,
     pub updated: DateTime<Utc>,
     pub mine: bool,
 }
@@ -141,6 +169,7 @@ pub mod tests {
             title: format!("PR {number}"),
             author: author.into(),
             status,
+            ci: None,
             updated: DateTime::UNIX_EPOCH,
             mine: author == "me",
         }

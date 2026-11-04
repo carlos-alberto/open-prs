@@ -639,9 +639,11 @@ impl App {
     fn table_widget(&self, now: DateTime<Utc>) -> Table<'static> {
         let by_repo = self.group == Group::Repo;
         let headers: &[&str] = if by_repo {
-            &["Repo", "Host", "#", "Status", "Author", "Updated", "Title"]
+            &[
+                "Repo", "Host", "#", "Status", "CI", "Author", "Updated", "Title",
+            ]
         } else {
-            &["Author", "Host", "PR", "Status", "Updated", "Title"]
+            &["Author", "Host", "PR", "Status", "CI", "Updated", "Title"]
         };
         let owner = self.owner.as_deref();
 
@@ -669,16 +671,23 @@ impl App {
                 p.status.label().to_owned(),
                 Style::new().fg(p.status.color()),
             );
+            // Blank when the last commit has no checks
+            let ci = p.ci.map_or_else(
+                || (String::new(), plain),
+                |ci| (ci.label().to_owned(), Style::new().fg(ci.color())),
+            );
             if by_repo {
                 row.extend([
                     (format!("#{}", p.number), plain),
                     status,
+                    ci,
                     (p.author.clone(), plain),
                 ]);
             } else {
                 row.extend([
                     (format!("{}#{}", p.repo_without(owner), p.number), plain),
                     status,
+                    ci,
                 ]);
             }
             row.extend([(age(p.updated, now), plain), (p.title.clone(), plain)]);
@@ -848,6 +857,7 @@ fn base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pr::Ci;
     use crate::pr::tests::pr;
 
     fn github() -> Source {
@@ -1076,6 +1086,8 @@ mod tests {
             pr("GitHub", "billing", 4018, "me", Status::Approved),
             pr("GitHub", "web", 1207, "zed", Status::Changes),
         ];
+        app.feeds[0].prs[0].ci = Some(Ci::Failing);
+        app.feeds[0].prs[1].ci = Some(Ci::Passed);
         app.show();
         app.notify(
             "GitHub failed".into(),
@@ -1085,9 +1097,11 @@ mod tests {
         );
         let lines = screen(&mut app, 110, 12);
         assert!(lines[0].contains("Open PRs — 3 PRs · by repo"));
-        assert!(lines[1].starts_with("Repo     Host    #      Status"));
-        assert!(lines[2].starts_with("billing  GitHub  #4012  needs review"));
-        assert!(lines[3].starts_with("         GitHub  #4018  approved"));
+        assert!(lines[1].starts_with("Repo     Host    #      Status             CI       Author"));
+        assert!(lines[2].starts_with("billing  GitHub  #4012  needs review       failing  amy"));
+        assert!(lines[3].starts_with("         GitHub  #4018  approved           passed   me"));
+        // No checks leaves the CI cell blank
+        assert!(lines[4].starts_with("web      GitHub  #1207  changes requested           zed"));
         assert!(lines.iter().any(|l| l.contains(" GitHub failed ")));
         assert!(lines[11].starts_with(" o  Open"));
         assert!(lines[11].contains(" s  Sources"));

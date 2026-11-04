@@ -1,6 +1,6 @@
 # open_prs
 
-Lists open PRs on GitHub, Forgejo and Gitea, with their review status, in a TUI.
+Lists open PRs on GitHub, Forgejo and Gitea, with their review status and CI status, in a TUI.
 
 ```
 open_prs [-m/--mine] [-a/--approved | -n/--needs-review] [-g/--group repo|user] [-i/--interval SECONDS]
@@ -23,7 +23,8 @@ It reloads every SECONDS (default 60) and keeps the cursor on the same PR.
 | `q`, `ctrl+c` | Quit |
 
 When stdout isn't a terminal, it prints one tab-separated line per PR instead:
-host, repo, number, status, author, title, url. It exits 1 if a source failed.
+host, repo, number, status, author, title, url, ci. The ci column is `passed`, `failing`,
+`pending`, or empty when the last commit has no checks. It exits 1 if a source failed.
 
 ## Sources
 

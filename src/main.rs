@@ -8,7 +8,7 @@
 //! enter/o open the PR in the browser, y copy its URL, r reload now, q quit.
 //!
 //! When stdout isn't a terminal it prints one tab-separated line per PR instead:
-//! host, repo, number, status, author, title, url.
+//! host, repo, number, status, author, title, url, ci.
 
 mod app;
 mod config;
@@ -24,7 +24,7 @@ use std::time::Duration;
 use clap::Parser;
 
 use crate::config::Source;
-use crate::pr::{Group, Status, pick};
+use crate::pr::{Ci, Group, Status, pick};
 
 #[derive(Parser)]
 #[command(
@@ -36,7 +36,8 @@ use crate::pr::{Group, Status, pick};
                   Keys: enter/o open the PR in the browser, y copy its URL, r reload now, \
                   m/a/n/g toggle the flags, s add, edit and delete sources, q quit.\n\
                   When stdout isn't a terminal, it prints one tab-separated line per PR: \
-                  host, repo, number, status, author, title, url."
+                  host, repo, number, status, author, title, url, ci (passed, failing, pending \
+                  or empty)."
 )]
 struct Args {
     /// Only PRs you opened
@@ -122,7 +123,7 @@ fn plain(sources: &[Source], mine: bool, status: Option<Status>, group: Group) -
     let mut out = io::stdout().lock();
     for p in pick(&prs, mine, status, group) {
         let number = p.number.to_string();
-        let fields = [
+        let fields: [&str; 8] = [
             &p.host,
             &p.repo,
             &number,
@@ -130,6 +131,8 @@ fn plain(sources: &[Source], mine: bool, status: Option<Status>, group: Group) -
             &p.author,
             &p.title,
             &p.url,
+            // Last, so the columns before it stay where they were
+            p.ci.map_or("", Ci::label),
         ];
         // Stop quietly when the reader goes away, as with `| head`
         if writeln!(out, "{}", fields.join("\t")).is_err() {
