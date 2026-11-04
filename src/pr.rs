@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
-use ratatui::style::Color;
+use ratatui::style::{Color, Style};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -54,6 +54,34 @@ impl Ci {
     }
 }
 
+/// Something to know about a PR, in the Notes column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Note {
+    /// It asks for your review
+    ForYou,
+    Draft,
+    /// It can't merge into its base branch
+    Conflict,
+}
+
+impl Note {
+    pub fn label(self) -> &'static str {
+        match self {
+            Note::ForYou => "for you",
+            Note::Draft => "draft",
+            Note::Conflict => "conflict",
+        }
+    }
+
+    pub fn style(self) -> Style {
+        match self {
+            Note::ForYou => Style::new().magenta().bold(),
+            Note::Draft => Style::new().dim(),
+            Note::Conflict => Style::new().red(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Group {
     Repo,
@@ -89,8 +117,14 @@ pub struct Pr {
     pub status: Status,
     /// None when the last commit has no checks
     pub ci: Option<Ci>,
+    /// The page with the PR's CI runs
+    pub checks_url: String,
     pub updated: DateTime<Utc>,
     pub mine: bool,
+    /// It asks for your review
+    pub requested: bool,
+    pub draft: bool,
+    pub conflict: bool,
 }
 
 impl Pr {
@@ -105,6 +139,61 @@ impl Pr {
             .and_then(|r| r.strip_prefix('/'))
             .unwrap_or(&self.repo)
     }
+
+    pub fn notes(&self) -> Vec<Note> {
+        [
+            (self.requested, Note::ForYou),
+            (self.draft, Note::Draft),
+            (self.conflict, Note::Conflict),
+        ]
+        .into_iter()
+        .filter_map(|(on, note)| on.then_some(note))
+        .collect()
+    }
+}
+
+/// Which PRs to show. The flags set it, and keys in the TUI toggle each part.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Filter {
+    /// Only PRs you opened
+    pub mine: bool,
+    pub status: Option<Status>,
+    /// Only PRs that ask for your review
+    pub for_you: bool,
+    /// Only PRs with failing CI
+    pub failing: bool,
+    pub hide_drafts: bool,
+}
+
+impl Filter {
+    pub fn matches(&self, p: &Pr) -> bool {
+        (p.mine || !self.mine)
+            && self.status.is_none_or(|s| s == p.status)
+            && (p.requested || !self.for_you)
+            && (p.ci == Some(Ci::Failing) || !self.failing)
+            && !(p.draft && self.hide_drafts)
+    }
+
+    /// What it leaves out, for the subtitle.
+    pub fn describe(&self) -> Vec<String> {
+        let mut parts = Vec::new();
+        if self.mine {
+            parts.push("mine".into());
+        }
+        if let Some(status) = self.status {
+            parts.push(format!("{} only", status.label()));
+        }
+        if self.for_you {
+            parts.push("for you".into());
+        }
+        if self.failing {
+            parts.push("failing CI".into());
+        }
+        if self.hide_drafts {
+            parts.push("no drafts".into());
+        }
+        parts
+    }
 }
 
 /// The owner of every PR, if they all have the same one, so the table can leave it out.
@@ -116,16 +205,11 @@ pub fn shared_owner<'a>(prs: impl IntoIterator<Item = &'a Pr>) -> Option<String>
 
 /// The PRs to show, in the order to show them. When two sources find the same PR, the
 /// first one's copy stays.
-pub fn pick<'a>(
-    prs: impl IntoIterator<Item = &'a Pr>,
-    mine: bool,
-    status: Option<Status>,
-    group: Group,
-) -> Vec<Pr> {
+pub fn pick<'a>(prs: impl IntoIterator<Item = &'a Pr>, filter: &Filter, group: Group) -> Vec<Pr> {
     let mut seen = HashSet::new();
     let mut prs: Vec<Pr> = prs
         .into_iter()
-        .filter(|p| (p.mine || !mine) && status.is_none_or(|s| s == p.status))
+        .filter(|p| filter.matches(p))
         .filter(|p| seen.insert(p.url.as_str()))
         .cloned()
         .collect();
@@ -161,9 +245,11 @@ pub mod tests {
         } else {
             format!("acme/{repo}")
         };
+        let url = format!("https://{host}.example.com/{repo}/{number}");
         Pr {
             host: host.into(),
-            url: format!("https://{host}.example.com/{repo}/{number}"),
+            checks_url: format!("{url}/checks"),
+            url,
             repo,
             number,
             title: format!("PR {number}"),
@@ -172,7 +258,17 @@ pub mod tests {
             ci: None,
             updated: DateTime::UNIX_EPOCH,
             mine: author == "me",
+            requested: false,
+            draft: false,
+            conflict: false,
         }
+    }
+
+    fn numbers(prs: &[Pr], filter: &Filter) -> Vec<u64> {
+        pick(prs, filter, Group::Repo)
+            .iter()
+            .map(|p| p.number)
+            .collect()
     }
 
     #[test]
@@ -183,7 +279,7 @@ pub mod tests {
             pr("Forgejo", "a", 9, "x", Status::Needs),
             pr("GitHub", "a", 1, "x", Status::Needs),
         ];
-        let got: Vec<_> = pick(&prs, false, None, Group::Repo)
+        let got: Vec<_> = pick(&prs, &Filter::default(), Group::Repo)
             .into_iter()
             .map(|p| (p.repo, p.host, p.number))
             .collect();
@@ -203,7 +299,7 @@ pub mod tests {
             pr("GitHub", "a", 1, "zed", Status::Needs),
             pr("GitHub", "b", 1, "amy", Status::Needs),
         ];
-        let got: Vec<_> = pick(&prs, false, None, Group::User)
+        let got: Vec<_> = pick(&prs, &Filter::default(), Group::User)
             .into_iter()
             .map(|p| p.author)
             .collect();
@@ -217,16 +313,72 @@ pub mod tests {
             pr("GitHub", "a", 2, "me", Status::Needs),
             pr("GitHub", "a", 3, "you", Status::Approved),
         ];
-        let numbers = |mine, status| -> Vec<u64> {
-            pick(&prs, mine, status, Group::Repo)
-                .iter()
-                .map(|p| p.number)
-                .collect()
+        let filter = |mine, status| Filter {
+            mine,
+            status,
+            ..Filter::default()
         };
-        assert_eq!(numbers(false, None), [1, 2, 3]);
-        assert_eq!(numbers(true, None), [1, 2]);
-        assert_eq!(numbers(false, Some(Status::Approved)), [1, 3]);
-        assert_eq!(numbers(true, Some(Status::Approved)), [1]);
+        assert_eq!(numbers(&prs, &filter(false, None)), [1, 2, 3]);
+        assert_eq!(numbers(&prs, &filter(true, None)), [1, 2]);
+        assert_eq!(
+            numbers(&prs, &filter(false, Some(Status::Approved))),
+            [1, 3]
+        );
+        assert_eq!(numbers(&prs, &filter(true, Some(Status::Approved))), [1]);
+    }
+
+    #[test]
+    fn pick_filters_review_requests_failing_ci_and_drafts() {
+        let mut prs = [1, 2, 3, 4].map(|n| pr("GitHub", "a", n, "x", Status::Needs));
+        prs[0].requested = true;
+        prs[1].ci = Some(Ci::Failing);
+        prs[2].ci = Some(Ci::Pending);
+        prs[3].draft = true;
+        prs[3].ci = Some(Ci::Failing);
+        let for_you = Filter {
+            for_you: true,
+            ..Filter::default()
+        };
+        let failing = Filter {
+            failing: true,
+            ..Filter::default()
+        };
+        let no_drafts = Filter {
+            hide_drafts: true,
+            ..Filter::default()
+        };
+        assert_eq!(numbers(&prs, &for_you), [1]);
+        assert_eq!(numbers(&prs, &failing), [2, 4]);
+        assert_eq!(numbers(&prs, &no_drafts), [1, 2, 3]);
+        assert_eq!(
+            numbers(
+                &prs,
+                &Filter {
+                    hide_drafts: true,
+                    ..failing.clone()
+                }
+            ),
+            [2]
+        );
+        assert_eq!(
+            Filter {
+                mine: true,
+                failing: true,
+                hide_drafts: true,
+                ..for_you
+            }
+            .describe(),
+            ["mine", "for you", "failing CI", "no drafts"]
+        );
+    }
+
+    #[test]
+    fn notes_list_what_is_true_in_order() {
+        let mut p = pr("GitHub", "a", 1, "x", Status::Needs);
+        assert!(p.notes().is_empty());
+        p.conflict = true;
+        p.requested = true;
+        assert_eq!(p.notes(), [Note::ForYou, Note::Conflict]);
     }
 
     #[test]
@@ -234,7 +386,7 @@ pub mod tests {
         let mut copy = pr("GitHub", "a", 1, "x", Status::Needs);
         copy.host = "Work GitHub".into();
         let prs = [pr("GitHub", "a", 1, "x", Status::Needs), copy];
-        let hosts: Vec<_> = pick(&prs, false, None, Group::Repo)
+        let hosts: Vec<_> = pick(&prs, &Filter::default(), Group::Repo)
             .into_iter()
             .map(|p| p.host)
             .collect();

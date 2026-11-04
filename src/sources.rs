@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -59,7 +59,7 @@ query($q: String!, $endCursor: String) {
   search(query: $q, type: ISSUE, first: 50, after: $endCursor) {
     pageInfo { hasNextPage endCursor }
     nodes { ... on PullRequest {
-      number title url reviewDecision updatedAt
+      number title url reviewDecision updatedAt isDraft mergeable
       author { login }
       repository { nameWithOwner }
       latestOpinionatedReviews(first: 20) { nodes { state } }
@@ -68,9 +68,28 @@ query($q: String!, $endCursor: String) {
   }
 }";
 
+/// Only the URLs, for the search for PRs that ask for your review.
+const GITHUB_URLS_QUERY: &str = "
+query($q: String!, $endCursor: String) {
+  search(query: $q, type: ISSUE, first: 100, after: $endCursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest { url } }
+  }
+}";
+
 #[derive(Deserialize)]
 struct GhPage {
     data: GhData,
+}
+
+#[derive(Deserialize)]
+struct GhUrlPage {
+    data: GhUrlData,
+}
+
+#[derive(Deserialize)]
+struct GhUrlData {
+    search: GhSearch,
 }
 
 #[derive(Deserialize)]
@@ -97,6 +116,9 @@ struct GhPr {
     url: String,
     review_decision: Option<String>,
     updated_at: DateTime<Utc>,
+    is_draft: bool,
+    /// MERGEABLE, CONFLICTING, or UNKNOWN while GitHub works it out
+    mergeable: String,
     author: Option<GhLogin>,
     repository: GhRepo,
     latest_opinionated_reviews: GhReviews,
@@ -137,14 +159,43 @@ struct GhState {
 }
 
 fn github(name: &str, query: &str, hostname: Option<&str>) -> Result<Vec<Pr>> {
-    let search = format!("q=is:pr is:open {query}");
-    let graphql = format!("query={GITHUB_QUERY}");
-    let mut cmd = vec!["gh", "api"];
-    if let Some(hostname) = hostname {
-        cmd.extend(["--hostname", hostname]);
+    let gh = |search: &str, graphql: &str| {
+        let search = format!("q=is:pr is:open {search}");
+        let graphql = format!("query={graphql}");
+        let mut cmd = vec!["gh", "api"];
+        if let Some(hostname) = hostname {
+            cmd.extend(["--hostname", hostname]);
+        }
+        cmd.extend(["graphql", "--paginate", "-f", &search, "-f", &graphql]);
+        run(&cmd)
+    };
+    // review-requested also finds requests to your teams, which the PR's own list of
+    // reviewers can't tell apart from other teams'
+    let (prs, requested) = thread::scope(|s| {
+        let requested = s.spawn(|| gh(&format!("{query} review-requested:@me"), GITHUB_URLS_QUERY));
+        (gh(query, GITHUB_QUERY), requested.join().unwrap())
+    });
+    let requested = parse_urls(&requested?)?;
+    let mut prs = parse_github(name, &prs?)?;
+    for p in &mut prs {
+        p.requested = requested.contains(&p.url);
     }
-    cmd.extend(["graphql", "--paginate", "-f", &search, "-f", &graphql]);
-    parse_github(name, &run(&cmd)?)
+    Ok(prs)
+}
+
+fn parse_urls(out: &str) -> Result<HashSet<String>> {
+    let mut urls = HashSet::new();
+    for page in serde_json::Deserializer::from_str(out).into_iter::<GhUrlPage>() {
+        let page = page.context("could not read the reply from gh")?;
+        urls.extend(
+            page.data
+                .search
+                .nodes
+                .iter()
+                .filter_map(|n| n.get("url")?.as_str().map(String::from)),
+        );
+    }
+    Ok(urls)
 }
 
 fn parse_github(name: &str, out: &str) -> Result<Vec<Pr>> {
@@ -179,7 +230,6 @@ fn parse_github(name: &str, out: &str) -> Result<Vec<Pr>> {
                 repo: n.repository.name_with_owner,
                 number: n.number,
                 title: n.title,
-                url: n.url,
                 mine: author == me,
                 author,
                 status: match decision.as_deref() {
@@ -188,7 +238,12 @@ fn parse_github(name: &str, out: &str) -> Result<Vec<Pr>> {
                     _ => Status::Needs,
                 },
                 ci: rollup.and_then(|r| github_ci(&r.state)),
+                checks_url: format!("{}/checks", n.url),
+                url: n.url,
                 updated: n.updated_at,
+                requested: false,
+                draft: n.is_draft,
+                conflict: n.mergeable == "CONFLICTING",
             });
         }
     }
@@ -237,6 +292,9 @@ struct TeaIssue {
 struct TeaPull {
     #[serde(default)]
     reviews: Option<Vec<TeaReview>>,
+    /// False while it has a conflict, but also while it is a draft or Forgejo checks it
+    #[serde(default)]
+    mergeable: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -297,6 +355,8 @@ fn forgejo(name: &str, login: &str, owner: Option<&str>) -> Result<Vec<Pr>> {
     let status = |pr: &TeaIssue| -> Result<Pr> {
         let repo = format!("{}/{}", pr.owner, pr.repo);
         let pull: TeaPull = tea(login, &["pulls", &pr.index, "--repo", &repo])?;
+        let reviews = pull.reviews.unwrap_or_default();
+        let draft = forgejo_draft(&pr.title);
         Ok(Pr {
             host: name.into(),
             number: pr
@@ -306,11 +366,15 @@ fn forgejo(name: &str, login: &str, owner: Option<&str>) -> Result<Vec<Pr>> {
             repo,
             title: pr.title.clone(),
             url: pr.url.clone(),
+            checks_url: forgejo_checks_url(&pr.url),
             author: pr.author_id.clone(),
-            status: forgejo_status(pull.reviews.unwrap_or_default()),
+            status: forgejo_status(&reviews),
             ci: None,
             updated: pr.updated,
             mine: pr.author_id == me,
+            requested: forgejo_requested(&reviews, &me),
+            draft,
+            conflict: pull.mergeable == Some(false) && !draft,
         })
     };
 
@@ -379,10 +443,9 @@ fn forgejo_ci_state(state: &str) -> Option<Ci> {
 }
 
 /// The latest verdict per reviewer: any change request wins, then any approval.
-fn forgejo_status(mut reviews: Vec<TeaReview>) -> Status {
-    reviews.sort_by_key(|r| r.id);
+fn forgejo_status(reviews: &[TeaReview]) -> Status {
     let mut latest = HashMap::new();
-    for r in &reviews {
+    for r in by_id(reviews) {
         if r.state == "APPROVED" || r.state == "REQUEST_CHANGES" {
             latest.insert(&r.reviewer, &r.state);
         }
@@ -393,6 +456,36 @@ fn forgejo_status(mut reviews: Vec<TeaReview>) -> Status {
         Status::Approved
     } else {
         Status::Needs
+    }
+}
+
+/// Whether the last entry from `me` asks for a review, so a review since then answers it.
+fn forgejo_requested(reviews: &[TeaReview], me: &str) -> bool {
+    by_id(reviews)
+        .into_iter()
+        .rfind(|r| r.reviewer == me)
+        .is_some_and(|r| r.state == "REQUEST_REVIEW")
+}
+
+fn by_id(reviews: &[TeaReview]) -> Vec<&TeaReview> {
+    let mut sorted: Vec<_> = reviews.iter().collect();
+    sorted.sort_by_key(|r| r.id);
+    sorted
+}
+
+/// Forgejo and Gitea mark a draft with a prefix on the title, in any case.
+fn forgejo_draft(title: &str) -> bool {
+    let title = title.to_uppercase();
+    ["WIP:", "[WIP]"]
+        .iter()
+        .any(|prefix| title.starts_with(prefix))
+}
+
+/// The repo's list of action runs, as Forgejo has no checks page per PR.
+fn forgejo_checks_url(pr_url: &str) -> String {
+    match pr_url.rsplit_once("/pulls/") {
+        Some((repo, _)) => format!("{repo}/actions"),
+        None => pr_url.into(),
     }
 }
 
@@ -434,18 +527,15 @@ mod tests {
 
     #[test]
     fn forgejo_uses_the_latest_verdict_per_reviewer() {
-        assert_eq!(forgejo_status(vec![]), Status::Needs);
+        assert_eq!(forgejo_status(&[]), Status::Needs);
+        assert_eq!(forgejo_status(&[review(1, "a", "COMMENT")]), Status::Needs);
         assert_eq!(
-            forgejo_status(vec![review(1, "a", "COMMENT")]),
-            Status::Needs
-        );
-        assert_eq!(
-            forgejo_status(vec![review(1, "a", "APPROVED")]),
+            forgejo_status(&[review(1, "a", "APPROVED")]),
             Status::Approved
         );
         // a approved after asking for changes; the ids are out of order on purpose
         assert_eq!(
-            forgejo_status(vec![
+            forgejo_status(&[
                 review(2, "a", "APPROVED"),
                 review(1, "a", "REQUEST_CHANGES")
             ]),
@@ -453,15 +543,12 @@ mod tests {
         );
         // A comment after a verdict doesn't undo it
         assert_eq!(
-            forgejo_status(vec![
-                review(1, "a", "REQUEST_CHANGES"),
-                review(2, "a", "COMMENT")
-            ]),
+            forgejo_status(&[review(1, "a", "REQUEST_CHANGES"), review(2, "a", "COMMENT")]),
             Status::Changes
         );
         // Any open change request wins over another reviewer's approval
         assert_eq!(
-            forgejo_status(vec![
+            forgejo_status(&[
                 review(1, "a", "APPROVED"),
                 review(2, "b", "REQUEST_CHANGES")
             ]),
@@ -487,13 +574,17 @@ mod tests {
             )
         };
         let node = |number: u64, decision: &str, author: &str, reviews: &str| {
+            let (draft, mergeable) = match number {
+                2 => (true, "CONFLICTING"),
+                _ => (false, "UNKNOWN"),
+            };
             let commits = match number {
                 1 => r#"{"commit":{"statusCheckRollup":{"state":"FAILURE"}}}"#,
                 2 => r#"{"commit":{"statusCheckRollup":null}}"#,
                 _ => "",
             };
             format!(
-                r#"{{"number":{number},"title":"t","url":"u{number}","reviewDecision":{decision},"updatedAt":"2026-11-04T09:07:15Z","author":{author},"repository":{{"nameWithOwner":"acme/r"}},"latestOpinionatedReviews":{{"nodes":[{reviews}]}},"commits":{{"nodes":[{commits}]}}}}"#
+                r#"{{"number":{number},"title":"t","url":"u{number}","reviewDecision":{decision},"updatedAt":"2026-11-04T09:07:15Z","isDraft":{draft},"mergeable":"{mergeable}","author":{author},"repository":{{"nameWithOwner":"acme/r"}},"latestOpinionatedReviews":{{"nodes":[{reviews}]}},"commits":{{"nodes":[{commits}]}}}}"#
             )
         };
         let out = format!(
@@ -529,6 +620,20 @@ mod tests {
             .iter()
             .map(|p| (p.number, p.status, p.ci, p.author.as_str(), p.mine))
             .collect();
+        let notes: Vec<_> = prs
+            .iter()
+            .map(|p| (p.draft, p.conflict, p.requested))
+            .collect();
+        // Requests come from a second search, so none yet
+        assert_eq!(
+            notes,
+            [
+                (false, false, false),
+                (true, true, false),
+                (false, false, false)
+            ]
+        );
+        assert_eq!(prs[0].checks_url, "u1/checks");
         assert_eq!(
             got,
             [
@@ -536,6 +641,54 @@ mod tests {
                 (2, Status::Changes, None, "ghost", false),
                 (3, Status::Needs, None, "you", false),
             ]
+        );
+    }
+
+    #[test]
+    fn the_review_request_search_reads_urls_from_every_page() {
+        let out = r#"{"data":{"search":{"nodes":[{"url":"a"},{}]}}}
+{"data":{"search":{"nodes":[{"url":"b"},null]}}}"#;
+        let mut urls: Vec<_> = parse_urls(out).unwrap().into_iter().collect();
+        urls.sort();
+        assert_eq!(urls, ["a", "b"]);
+    }
+
+    #[test]
+    fn forgejo_asks_for_your_review_until_you_give_one() {
+        assert!(!forgejo_requested(&[], "me"));
+        assert!(forgejo_requested(
+            &[review(1, "me", "REQUEST_REVIEW")],
+            "me"
+        ));
+        assert!(!forgejo_requested(
+            &[review(1, "you", "REQUEST_REVIEW")],
+            "me"
+        ));
+        // The ids are out of order on purpose
+        assert!(!forgejo_requested(
+            &[
+                review(2, "me", "APPROVED"),
+                review(1, "me", "REQUEST_REVIEW")
+            ],
+            "me"
+        ));
+        assert!(forgejo_requested(
+            &[
+                review(1, "me", "APPROVED"),
+                review(2, "me", "REQUEST_REVIEW")
+            ],
+            "me"
+        ));
+    }
+
+    #[test]
+    fn forgejo_drafts_and_checks_pages() {
+        assert!(forgejo_draft("WIP: new thing"));
+        assert!(forgejo_draft("[wip] new thing"));
+        assert!(!forgejo_draft("Fix the WIP: label"));
+        assert_eq!(
+            forgejo_checks_url("https://git.example.com/acme/app/pulls/12"),
+            "https://git.example.com/acme/app/actions"
         );
     }
 

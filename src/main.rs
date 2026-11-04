@@ -1,14 +1,14 @@
-//! List open PRs on GitHub, Forgejo and Gitea with their review status, in a TUI.
+//! List open PRs on GitHub, Forgejo and Gitea with their review and CI status, in a TUI.
 //!
 //! The sources come from --github and --forgejo, else from the config file, else it searches
 //! github.com for the PRs that involve you. s in the TUI adds, edits and deletes them.
 //!
-//! The flags set how the TUI starts, and m, a, n and g toggle them while it runs. It
-//! reloads every SECONDS (default 60) and keeps the cursor on the same PR. Keys:
+//! The flags set how the TUI starts, and m, a, n, w, f, d and g toggle them while it runs.
+//! It reloads every SECONDS (default 60) and keeps the cursor on the same PR. Keys:
 //! enter/o open the PR in the browser, y copy its URL, r reload now, q quit.
 //!
 //! When stdout isn't a terminal it prints one tab-separated line per PR instead:
-//! host, repo, number, status, author, title, url, ci.
+//! host, repo, number, status, author, title, url, ci, notes.
 
 mod app;
 mod config;
@@ -24,20 +24,20 @@ use std::time::Duration;
 use clap::Parser;
 
 use crate::config::Source;
-use crate::pr::{Ci, Group, Status, pick};
+use crate::pr::{Ci, Filter, Group, Note, Status, pick};
 
 #[derive(Parser)]
 #[command(
     name = "open_prs",
-    about = "List open PRs on GitHub, Forgejo and Gitea with their review status.",
+    about = "List open PRs on GitHub, Forgejo and Gitea with their review and CI status.",
     after_help = "Sources: --github and --forgejo replace the ones in the config file \
                   ($XDG_CONFIG_HOME/open_prs/config.toml, else ~/.config/open_prs/config.toml). \
                   With neither, it searches github.com for involves:@me.\n\
                   Keys: enter/o open the PR in the browser, y copy its URL, r reload now, \
-                  m/a/n/g toggle the flags, s add, edit and delete sources, q quit.\n\
+                  m/a/n/w/f/d/g toggle the flags, s add, edit and delete sources, q quit.\n\
                   When stdout isn't a terminal, it prints one tab-separated line per PR: \
                   host, repo, number, status, author, title, url, ci (passed, failing, pending \
-                  or empty)."
+                  or empty), notes (for you, draft and conflict, with commas between)."
 )]
 struct Args {
     /// Only PRs you opened
@@ -49,6 +49,15 @@ struct Args {
     /// Only PRs that need review
     #[arg(short, long)]
     needs_review: bool,
+    /// Only PRs that ask for your review
+    #[arg(short = 'w', long)]
+    for_you: bool,
+    /// Only PRs with failing CI
+    #[arg(short, long)]
+    failing: bool,
+    /// Leave out draft PRs
+    #[arg(short = 'd', long)]
+    hide_drafts: bool,
     /// Group by repo or author
     #[arg(short, long, value_enum, default_value_t = Group::Repo)]
     group: Group,
@@ -66,12 +75,18 @@ struct Args {
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    let status = if args.approved {
-        Some(Status::Approved)
-    } else if args.needs_review {
-        Some(Status::Needs)
-    } else {
-        None
+    let filter = Filter {
+        mine: args.mine,
+        status: if args.approved {
+            Some(Status::Approved)
+        } else if args.needs_review {
+            Some(Status::Needs)
+        } else {
+            None
+        },
+        for_you: args.for_you,
+        failing: args.failing,
+        hide_drafts: args.hide_drafts,
     };
     let (sources, origin) = match config::load(&args.github, &args.forgejo) {
         Ok(loaded) => loaded,
@@ -82,11 +97,10 @@ fn main() -> ExitCode {
     };
 
     if !io::stdout().is_terminal() {
-        return plain(&sources, args.mine, status, args.group);
+        return plain(&sources, &filter, args.group);
     }
     let options = app::Options {
-        mine: args.mine,
-        status,
+        filter,
         group: args.group,
         interval: Duration::from_secs(args.interval),
     };
@@ -99,7 +113,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn plain(sources: &[Source], mine: bool, status: Option<Status>, group: Group) -> ExitCode {
+fn plain(sources: &[Source], filter: &Filter, group: Group) -> ExitCode {
     let results: Vec<_> = thread::scope(|s| {
         let handles: Vec<_> = sources
             .iter()
@@ -121,9 +135,12 @@ fn plain(sources: &[Source], mine: bool, status: Option<Status>, group: Group) -
     }
 
     let mut out = io::stdout().lock();
-    for p in pick(&prs, mine, status, group) {
+    for p in pick(&prs, filter, group) {
         let number = p.number.to_string();
-        let fields: [&str; 8] = [
+        let notes: Vec<_> = p.notes().into_iter().map(Note::label).collect();
+        let notes = notes.join(",");
+        // New columns go last, so the ones before them stay where they were
+        let fields: [&str; 9] = [
             &p.host,
             &p.repo,
             &number,
@@ -131,8 +148,8 @@ fn plain(sources: &[Source], mine: bool, status: Option<Status>, group: Group) -
             &p.author,
             &p.title,
             &p.url,
-            // Last, so the columns before it stay where they were
             p.ci.map_or("", Ci::label),
+            &notes,
         ];
         // Stop quietly when the reader goes away, as with `| head`
         if writeln!(out, "{}", fields.join("\t")).is_err() {

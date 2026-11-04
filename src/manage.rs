@@ -375,7 +375,7 @@ pub fn keys(keys: &[(&str, &str)]) -> Line<'static> {
 }
 
 /// A box in the middle of `area`, at most `width` wide.
-fn popup(area: Rect, width: u16, height: u16) -> Rect {
+pub fn popup(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
     Rect::new(

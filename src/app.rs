@@ -19,24 +19,53 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::config::{self, Change, Origin, Source};
 use crate::manage::{self, Form, FormAction, List, ListRow};
-use crate::pr::{Group, Pr, Status, age, pick, shared_owner};
+use crate::pr::{Filter, Group, Pr, Status, age, pick, shared_owner};
 use crate::sources;
 
 const TITLE: &str = "Open PRs";
 const COPIED_TIMEOUT: Duration = Duration::from_secs(5);
 const ERROR_TIMEOUT: Duration = Duration::from_secs(15);
 
-const KEYS: [(&str, &str); 9] = [
+/// The keys in the footer, most useful first; it shows as many as fit.
+const FOOTER: [(&str, &str); 12] = [
     ("o", "Open"),
-    ("y", "Copy URL"),
-    ("r", "Reload"),
+    ("c", "Checks"),
+    ("w", "For you"),
+    ("f", "Failing CI"),
     ("m", "Mine"),
+    ("s", "Sources"),
     ("a", "Approved"),
     ("n", "Needs review"),
+    ("d", "Drafts"),
     ("g", "Group"),
-    ("s", "Sources"),
-    ("q", "Quit"),
+    ("y", "Copy URL"),
+    ("r", "Reload"),
 ];
+
+/// The keys the footer always shows, at its end.
+const FOOTER_END: [(&str, &str); 2] = [("?", "Help"), ("q", "Quit")];
+
+/// Every key, for the help panel.
+const HELP: [(&str, &str); 15] = [
+    ("enter, o", "Open the PR in the browser"),
+    ("c", "Open the PR's CI runs"),
+    ("y", "Copy the PR's URL"),
+    ("r", "Reload now"),
+    ("m", "Only PRs you opened"),
+    ("a", "Only approved PRs"),
+    ("n", "Only PRs that need review"),
+    ("w", "Only PRs that ask for your review"),
+    ("f", "Only PRs with failing CI"),
+    ("d", "Hide drafts"),
+    ("g", "Group by repo or by author"),
+    ("s", "Add, edit and delete sources"),
+    ("↑ ↓ PgUp PgDn Home End", "Move the cursor"),
+    ("?", "Show this help"),
+    ("q, ctrl+c", "Quit"),
+];
+
+const NOTES_HELP: &str =
+    "Notes: for you, the PR asks for your review; draft, it isn't ready; conflict, it can't merge.";
 
 enum Msg {
     Input(io::Result<Event>),
@@ -63,6 +92,7 @@ enum State {
 
 enum Mode {
     Table,
+    Help,
     Sources(List),
     Form(Form),
 }
@@ -75,8 +105,7 @@ struct Toast {
 }
 
 pub struct App {
-    mine: bool,
-    status: Option<Status>,
+    filter: Filter,
     group: Group,
     interval: Duration,
     feeds: Vec<Feed>,
@@ -103,8 +132,7 @@ pub struct App {
 }
 
 pub struct Options {
-    pub mine: bool,
-    pub status: Option<Status>,
+    pub filter: Filter,
     pub group: Group,
     pub interval: Duration,
 }
@@ -151,8 +179,7 @@ impl App {
             })
             .collect::<Vec<_>>();
         App {
-            mine: options.mine,
-            status: options.status,
+            filter: options.filter,
             group: options.group,
             interval: options.interval,
             next_id: feeds.len() as u64,
@@ -264,7 +291,7 @@ impl App {
         let row = self.table.selected().unwrap_or(0);
         let all = || self.feeds.iter().flat_map(|f| &f.prs);
         self.owner = shared_owner(all());
-        self.rows = pick(all(), self.mine, self.status, self.group);
+        self.rows = pick(all(), &self.filter, self.group);
         if self.rows.is_empty() {
             self.table.select(None);
             return;
@@ -346,6 +373,8 @@ impl App {
             Mode::Table => self.on_table_key(key),
             Mode::Sources(list) => self.on_sources_key(list, key),
             Mode::Form(form) => self.on_form_key(form, key),
+            // Any key closes the help
+            Mode::Help => {}
         }
     }
 
@@ -353,20 +382,22 @@ impl App {
         let page = usize::from(self.table_area.height.saturating_sub(1)).max(1);
         match key.code {
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Enter | KeyCode::Char('o') => self.open_pr(),
+            KeyCode::Enter | KeyCode::Char('o') => self.open(|p| &p.url),
+            KeyCode::Char('c') => self.open(|p| &p.checks_url),
             KeyCode::Char('y') => self.copy_url(),
             KeyCode::Char('r') => self.reload(),
-            KeyCode::Char('m') => {
-                self.mine = !self.mine;
-                self.show();
-            }
+            KeyCode::Char('m') => self.toggle(|f| &mut f.mine),
             KeyCode::Char('a') => self.toggle_status(Status::Approved),
             KeyCode::Char('n') => self.toggle_status(Status::Needs),
+            KeyCode::Char('w') => self.toggle(|f| &mut f.for_you),
+            KeyCode::Char('f') => self.toggle(|f| &mut f.failing),
+            KeyCode::Char('d') => self.toggle(|f| &mut f.hide_drafts),
             KeyCode::Char('g') => {
                 self.group = self.group.toggled();
                 self.show();
             }
             KeyCode::Char('s') => self.mode = Mode::Sources(List::default()),
+            KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Down => self.move_cursor(1),
             KeyCode::Up => self.move_cursor(-1),
             KeyCode::PageDown => self.move_cursor(page as isize),
@@ -457,7 +488,7 @@ impl App {
                 }
                 // Like Enter, a click on the row under the cursor opens it
                 if self.table.selected() == Some(index) {
-                    self.open_pr();
+                    self.open(|p| &p.url);
                 } else {
                     self.table.select(Some(index));
                 }
@@ -476,9 +507,15 @@ impl App {
             .select(Some(row.saturating_add_signed(by).min(last)));
     }
 
+    fn toggle(&mut self, part: fn(&mut Filter) -> &mut bool) {
+        let on = part(&mut self.filter);
+        *on = !*on;
+        self.show();
+    }
+
     fn toggle_status(&mut self, status: Status) {
         // A PR can't be both approved and need review, so each filter replaces the other
-        self.status = if self.status == Some(status) {
+        self.filter.status = if self.filter.status == Some(status) {
             None
         } else {
             Some(status)
@@ -486,8 +523,9 @@ impl App {
         self.show();
     }
 
-    fn open_pr(&mut self) {
-        let Some(url) = self.selected().map(|p| p.url.clone()) else {
+    /// Opens a page of the PR under the cursor in the browser.
+    fn open(&mut self, page: fn(&Pr) -> &String) {
+        let Some(url) = self.selected().map(|p| page(p).clone()) else {
             return;
         };
         let opener = if cfg!(target_os = "macos") {
@@ -546,12 +584,7 @@ impl App {
             format!("{} PRs", self.rows.len()),
             format!("by {}", self.group.name()),
         ];
-        if self.mine {
-            parts.push("mine".into());
-        }
-        if let Some(status) = self.status {
-            parts.push(format!("{} only", status.label()));
-        }
+        parts.extend(self.filter.describe());
         let mut loading: Vec<_> = self
             .feeds
             .iter()
@@ -588,7 +621,7 @@ impl App {
         self.table_area = body;
         let table = self.table_widget(Utc::now());
         frame.render_stateful_widget(table, body, &mut self.table);
-        frame.render_widget(manage::keys(&KEYS), footer);
+        frame.render_widget(footer_keys(footer.width), footer);
 
         match &self.mode {
             Mode::Table => {}
@@ -596,6 +629,7 @@ impl App {
                 manage::draw_list(frame, body, list, &self.source_rows(), &self.save_note());
             }
             Mode::Form(form) => form.draw(frame, body),
+            Mode::Help => draw_help(frame, body),
         }
         self.draw_toasts(frame, body);
     }
@@ -640,14 +674,16 @@ impl App {
         let by_repo = self.group == Group::Repo;
         let headers: &[&str] = if by_repo {
             &[
-                "Repo", "Host", "#", "Status", "CI", "Author", "Updated", "Title",
+                "Repo", "Host", "#", "Status", "CI", "Notes", "Author", "Updated", "Title",
             ]
         } else {
-            &["Author", "Host", "PR", "Status", "CI", "Updated", "Title"]
+            &[
+                "Author", "Host", "PR", "Status", "CI", "Notes", "Updated", "Title",
+            ]
         };
         let owner = self.owner.as_deref();
 
-        let mut cells: Vec<Vec<(String, Style)>> = Vec::with_capacity(self.rows.len());
+        let mut cells: Vec<Vec<Line<'static>>> = Vec::with_capacity(self.rows.len());
         let mut last: Option<(&str, Option<&str>)> = None;
         for p in &self.rows {
             // Name each group once, so the blank cells under it show where it ends
@@ -665,32 +701,39 @@ impl App {
             };
             last = Some(group);
 
-            let plain = Style::new();
-            let mut row = vec![(label, plain), (p.host.clone(), Style::new().dim())];
-            let status = (
-                p.status.label().to_owned(),
-                Style::new().fg(p.status.color()),
-            );
+            let mut row = vec![Line::raw(label), Line::raw(p.host.clone()).dim()];
+            let status = Line::styled(p.status.label(), Style::new().fg(p.status.color()));
             // Blank when the last commit has no checks
-            let ci = p.ci.map_or_else(
-                || (String::new(), plain),
-                |ci| (ci.label().to_owned(), Style::new().fg(ci.color())),
+            let ci = p.ci.map_or_else(Line::default, |ci| {
+                Line::styled(ci.label(), Style::new().fg(ci.color()))
+            });
+            let notes = Line::from(
+                p.notes()
+                    .into_iter()
+                    .enumerate()
+                    .flat_map(|(i, note)| {
+                        let gap = Span::raw(if i == 0 { "" } else { " " });
+                        [gap, Span::styled(note.label(), note.style())]
+                    })
+                    .collect::<Vec<_>>(),
             );
             if by_repo {
                 row.extend([
-                    (format!("#{}", p.number), plain),
+                    Line::raw(format!("#{}", p.number)),
                     status,
                     ci,
-                    (p.author.clone(), plain),
+                    notes,
+                    Line::raw(p.author.clone()),
                 ]);
             } else {
                 row.extend([
-                    (format!("{}#{}", p.repo_without(owner), p.number), plain),
+                    Line::raw(format!("{}#{}", p.repo_without(owner), p.number)),
                     status,
                     ci,
+                    notes,
                 ]);
             }
-            row.extend([(age(p.updated, now), plain), (p.title.clone(), plain)]);
+            row.extend([Line::raw(age(p.updated, now)), Line::raw(p.title.clone())]);
             cells.push(row);
         }
 
@@ -700,20 +743,15 @@ impl App {
                 if i == headers.len() - 1 {
                     return Constraint::Fill(1);
                 }
-                let widest = cells
-                    .iter()
-                    .map(|row| Span::raw(row[i].0.as_str()).width())
-                    .max()
-                    .unwrap_or(0);
+                let widest = cells.iter().map(|row| row[i].width()).max().unwrap_or(0);
                 Constraint::Length(widest.max(headers[i].len()) as u16)
             })
             .collect();
 
-        let rows = cells.into_iter().map(|row| {
-            Row::new(
-                row.into_iter()
-                    .map(|(text, style)| Cell::from(Span::styled(text, style))),
-            )
+        let rows = cells.into_iter().zip(&self.rows).map(|(row, p)| {
+            let row = Row::new(row.into_iter().map(Cell::from));
+            // A draft isn't ready for review yet
+            if p.draft { row.dim() } else { row }
         });
         Table::new(rows, widths)
             .header(Row::new(headers.iter().map(|h| Cell::from(*h))).bold())
@@ -757,6 +795,55 @@ impl App {
             );
         }
     }
+}
+
+/// As many footer keys as fit in `width`, then the ones it always shows.
+fn footer_keys(width: u16) -> Line<'static> {
+    // manage::keys draws each as " key " then " label  "
+    let size =
+        |(key, label): &(&str, &str)| Span::raw(*key).width() + Span::raw(*label).width() + 5;
+    let mut room = usize::from(width).saturating_sub(FOOTER_END.iter().map(size).sum());
+    let mut shown: Vec<(&str, &str)> = FOOTER
+        .iter()
+        .take_while(|k| {
+            let fits = size(k) <= room;
+            room = room.saturating_sub(size(k));
+            fits
+        })
+        .copied()
+        .collect();
+    shown.extend(FOOTER_END);
+    manage::keys(&shown)
+}
+
+fn draw_help(frame: &mut Frame, area: Rect) {
+    let key_width = HELP
+        .iter()
+        .map(|(k, _)| Span::raw(*k).width())
+        .max()
+        .unwrap_or(0);
+    let mut lines: Vec<Line> = HELP
+        .iter()
+        .map(|(key, what)| {
+            Line::from(vec![
+                Span::styled(format!("{key:<key_width$}  "), Style::new().bold()),
+                Span::raw(*what),
+            ])
+        })
+        .collect();
+    lines.push(Line::raw(""));
+    lines.push(Line::from(NOTES_HELP).dim());
+    lines.push(Line::from("Any key closes this.").dim());
+    let rect = manage::popup(area, 100, lines.len() as u16 + 2);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" Keys ".bold())
+                .padding(Padding::horizontal(1)),
+        ),
+        rect,
+    );
 }
 
 /// `path` with the home folder as `~`.
@@ -872,8 +959,7 @@ mod tests {
     fn app(group: Group, sources: Vec<Source>) -> (App, Receiver<Msg>) {
         let (tx, rx) = mpsc::channel();
         let options = Options {
-            mine: false,
-            status: None,
+            filter: Filter::default(),
             group,
             interval: Duration::from_secs(60),
         };
@@ -961,8 +1047,8 @@ mod tests {
     #[test]
     fn subtitle_lists_the_filters_and_the_load_state() {
         let (mut app, _rx) = app(Group::User, vec![github(), forgejo()]);
-        app.mine = true;
-        app.status = Some(Status::Approved);
+        app.filter.mine = true;
+        app.filter.status = Some(Status::Approved);
         app.feeds.iter_mut().for_each(|f| f.state = State::Loading);
         assert_eq!(
             app.subtitle(),
@@ -1087,7 +1173,10 @@ mod tests {
             pr("GitHub", "web", 1207, "zed", Status::Changes),
         ];
         app.feeds[0].prs[0].ci = Some(Ci::Failing);
+        app.feeds[0].prs[0].requested = true;
+        app.feeds[0].prs[0].conflict = true;
         app.feeds[0].prs[1].ci = Some(Ci::Passed);
+        app.feeds[0].prs[2].draft = true;
         app.show();
         app.notify(
             "GitHub failed".into(),
@@ -1095,15 +1184,62 @@ mod tests {
             true,
             ERROR_TIMEOUT,
         );
-        let lines = screen(&mut app, 110, 12);
+        let lines = screen(&mut app, 130, 12);
         assert!(lines[0].contains("Open PRs — 3 PRs · by repo"));
-        assert!(lines[1].starts_with("Repo     Host    #      Status             CI       Author"));
-        assert!(lines[2].starts_with("billing  GitHub  #4012  needs review       failing  amy"));
-        assert!(lines[3].starts_with("         GitHub  #4018  approved           passed   me"));
+        assert!(lines[1].starts_with(
+            "Repo     Host    #      Status             CI       Notes             Author"
+        ));
+        assert!(lines[2].starts_with(
+            "billing  GitHub  #4012  needs review       failing  for you conflict  amy"
+        ));
+        assert!(lines[3].starts_with(
+            "         GitHub  #4018  approved           passed                     me"
+        ));
         // No checks leaves the CI cell blank
-        assert!(lines[4].starts_with("web      GitHub  #1207  changes requested           zed"));
+        assert!(lines[4].starts_with(
+            "web      GitHub  #1207  changes requested           draft             zed"
+        ));
         assert!(lines.iter().any(|l| l.contains(" GitHub failed ")));
         assert!(lines[11].starts_with(" o  Open"));
         assert!(lines[11].contains(" s  Sources"));
+        assert!(lines[11].trim_end().ends_with(" ?  Help   q  Quit"));
+    }
+
+    #[test]
+    fn the_footer_drops_keys_that_dont_fit_but_keeps_help_and_quit() {
+        let text = |width| -> String {
+            footer_keys(width)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        // c Checks needs 12 columns, and 10 are left
+        assert_eq!(text(40), " o  Open   ?  Help   q  Quit  ");
+        assert_eq!(text(42), " o  Open   c  Checks   ?  Help   q  Quit  ");
+        assert!(text(500).contains(" r  Reload  "));
+        assert_eq!(text(5), " ?  Help   q  Quit  ");
+    }
+
+    #[test]
+    fn question_mark_shows_every_key_until_any_key() {
+        let (mut app, _rx) = app(Group::Repo, vec![github()]);
+        app.on_key(key(KeyCode::Char('?')));
+        let lines = screen(&mut app, 110, 30);
+        assert!(lines.iter().any(|l| l.contains("Only PRs with failing CI")));
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(matches!(app.mode, Mode::Table));
+    }
+
+    #[test]
+    fn w_f_and_d_toggle_their_filters() {
+        let (mut app, _rx) = app(Group::Repo, vec![github()]);
+        for c in ['w', 'f', 'd'] {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        assert!(app.filter.for_you && app.filter.failing && app.filter.hide_drafts);
+        assert!(app.subtitle().contains("for you · failing CI · no drafts"));
+        app.on_key(key(KeyCode::Char('f')));
+        assert!(!app.filter.failing);
     }
 }

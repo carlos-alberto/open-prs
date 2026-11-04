@@ -3,28 +3,42 @@
 Lists open PRs on GitHub, Forgejo and Gitea, with their review status and CI status, in a TUI.
 
 ```
-open_prs [-m/--mine] [-a/--approved | -n/--needs-review] [-g/--group repo|user] [-i/--interval SECONDS]
+open_prs [-m/--mine] [-a/--approved | -n/--needs-review] [-w/--for-you] [-f/--failing]
+         [-d/--hide-drafts] [-g/--group repo|user] [-i/--interval SECONDS]
          [--github QUERY]... [--forgejo LOGIN]...
 ```
 
-The flags set how the TUI starts. The keys `m`, `a`, `n` and `g` toggle them while it runs.
-It reloads every SECONDS (default 60) and keeps the cursor on the same PR.
+The flags set how the TUI starts. The keys `m`, `a`, `n`, `w`, `f`, `d` and `g` toggle them
+while it runs. It reloads every SECONDS (default 60) and keeps the cursor on the same PR.
 
 | Key | Action |
 |-----|--------|
 | `enter`, `o`, click the cursor row | Open the PR in the browser |
+| `c` | Open the PR's CI runs |
 | `y` | Copy the PR's URL |
 | `r` | Reload now |
 | `m` | Only PRs you opened |
 | `a` / `n` | Only approved PRs / only PRs that need review |
+| `w` | Only PRs that ask for your review |
+| `f` | Only PRs with failing CI |
+| `d` | Hide drafts |
 | `g` | Group by repo or by author |
 | `s` | Add, edit and delete sources |
 | `↑` `↓` `PgUp` `PgDn` `Home` `End`, scroll | Move the cursor |
+| `?` | Show every key |
 | `q`, `ctrl+c` | Quit |
 
+The footer shows as many keys as fit, and `?` shows them all.
+
+The CI column is `passed`, `failing` or `pending`, and blank when the last commit has no
+checks. The Notes column says when a PR asks for your review (`for you`, which on GitHub
+includes requests to your teams), is a `draft`, or has a `conflict` with its base branch.
+Drafts are dim. On Forgejo, `c` opens the repo's list of action runs, as there is no
+checks page per PR.
+
 When stdout isn't a terminal, it prints one tab-separated line per PR instead:
-host, repo, number, status, author, title, url, ci. The ci column is `passed`, `failing`,
-`pending`, or empty when the last commit has no checks. It exits 1 if a source failed.
+host, repo, number, status, author, title, url, ci, notes. The notes have commas between
+them. It exits 1 if a source failed.
 
 ## Sources
 
