@@ -15,6 +15,7 @@ mod config;
 mod manage;
 mod pr;
 mod preview;
+mod reviewers;
 mod seen;
 mod sources;
 
@@ -36,7 +37,8 @@ use crate::seen::Seen;
     after_help = "Sources: --github and --forgejo replace the ones in the config file \
                   ($XDG_CONFIG_HOME/open_prs/config.toml, else ~/.config/open_prs/config.toml). \
                   With neither, it searches github.com for involves:@me.\n\
-                  Keys: enter/o open the PR in the browser, p preview it, y copy its URL, \
+                  Keys: enter/o open the PR in the browser, p preview it, v ask for reviews, \
+                  y copy its URL, \
                   r reload now, \
                   m/a/n/w/u/f/d/g toggle the flags, / changes the words, space marks the PR \
                   as seen, s add, edit and delete sources, ? every key, q quit.\n\

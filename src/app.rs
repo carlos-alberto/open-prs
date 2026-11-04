@@ -22,6 +22,7 @@ use crate::config::{self, Change, Origin, Source};
 use crate::manage::{self, Form, FormAction, List, ListRow};
 use crate::pr::{Filter, Group, Note, Pr, Status, age, pick, shared_owner};
 use crate::preview::{self, Preview};
+use crate::reviewers::{self, Picker, Reviewers};
 use crate::seen::Seen;
 use crate::sources;
 
@@ -30,13 +31,14 @@ const COPIED_TIMEOUT: Duration = Duration::from_secs(5);
 const ERROR_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The keys in the footer, most useful first; it shows as many as fit.
-const FOOTER: [(&str, &str); 17] = [
+const FOOTER: [(&str, &str); 18] = [
     ("o", "Open"),
     ("p", "Preview"),
     ("/", "Filter"),
     ("←→", "Columns"),
     ("c", "Checks"),
     ("u", "New"),
+    ("v", "Reviewers"),
     ("w", "For you"),
     ("f", "Failing CI"),
     ("m", "Mine"),
@@ -153,7 +155,7 @@ impl TableLayout {
 }
 
 /// Every key, for the help panel.
-const HELP: [(&str, &str); 21] = [
+const HELP: [(&str, &str); 22] = [
     (
         "enter, o",
         "Open the PR in the browser, and mark it as seen",
@@ -168,6 +170,7 @@ const HELP: [(&str, &str); 21] = [
     ),
     ("esc", "Clear the words"),
     ("c", "Open the PR's CI runs"),
+    ("v", "Ask people to review the PR, or stop asking them"),
     ("y", "Copy the PR's URL"),
     ("r", "Reload now"),
     ("m", "Only PRs you opened"),
@@ -197,6 +200,10 @@ enum Msg {
     Loaded(u64, Result<Vec<Pr>, String>),
     /// The preview of the PR with this URL
     Previewed(String, Result<Preview, String>),
+    /// Who reviews the PR with this URL, and who can
+    ReviewersLoaded(String, Result<Reviewers, String>),
+    /// The change to the reviewers of the PR with this URL is made, or failed
+    ReviewersSaved(String, Result<(), String>),
 }
 
 /// A source and what it found.
@@ -226,6 +233,7 @@ enum Mode {
     Sources(List),
     Form(Form),
     Preview(Box<View>),
+    Reviewers(Box<Picker>),
 }
 
 /// The preview of a PR, as it shows.
@@ -283,6 +291,10 @@ pub struct App {
     load: fn(&Source) -> Result<Vec<Pr>>,
     /// Loads the preview of a PR that this source found; the tests replace it too
     load_preview: fn(&Source, &Pr) -> Result<Preview>,
+    /// Loads who reviews a PR and who can, with the people in the source's PRs
+    load_reviewers: fn(&Source, &Pr, &[String]) -> Result<Reviewers>,
+    /// Changes who a PR asks for a review
+    save_reviewers: fn(&Source, &Pr, &reviewers::Change) -> Result<()>,
     /// The tea logins for the form's hint
     logins: fn() -> Vec<String>,
 }
@@ -366,6 +378,8 @@ impl App {
             quit: false,
             load: sources::fetch,
             load_preview: sources::preview,
+            load_reviewers: sources::reviewers,
+            save_reviewers: sources::request_reviews,
             // Without tea, the form shows no hint
             logins: || sources::tea_logins().unwrap_or_default(),
         }
@@ -388,6 +402,8 @@ impl App {
                 Ok(Msg::Input(event)) => self.on_event(event?),
                 Ok(Msg::Loaded(id, result)) => self.loaded(id, result),
                 Ok(Msg::Previewed(url, result)) => self.previewed(url, result),
+                Ok(Msg::ReviewersLoaded(url, result)) => self.reviewers_loaded(url, result),
+                Ok(Msg::ReviewersSaved(url, result)) => self.reviewers_saved(url, result),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -612,6 +628,7 @@ impl App {
             Mode::Form(form) => self.on_form_key(form, key),
             Mode::Search => self.on_search_key(key),
             Mode::Preview(view) => self.on_preview_key(view, key),
+            Mode::Reviewers(picker) => self.on_reviewers_key(picker, key),
             // Any key closes the help
             Mode::Help => {}
         }
@@ -623,6 +640,7 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Enter | KeyCode::Char('o') => self.open_pr(),
             KeyCode::Char('p') => self.preview(),
+            KeyCode::Char('v') => self.pick_reviewers(),
             KeyCode::Char('c') => self.open(|p| &p.checks_url),
             KeyCode::Char('y') => self.copy_url(),
             KeyCode::Char('r') => self.reload(),
@@ -663,13 +681,7 @@ impl App {
         let Some(p) = self.selected().cloned() else {
             return;
         };
-        // The first source that found it, as in the table
-        let Some(source) = self
-            .feeds
-            .iter()
-            .find(|f| f.prs.iter().any(|q| q.url == p.url))
-            .map(|f| f.source.clone())
-        else {
+        let Some((_, source)) = self.source_of(&p) else {
             return;
         };
         let (tx, load, pr) = (self.tx.clone(), self.load_preview, p.clone());
@@ -686,6 +698,92 @@ impl App {
             max_scroll: 0,
             page: 1,
         }));
+    }
+
+    /// The first source that found `p`, as in the table, and where it is in the feeds.
+    fn source_of(&self, p: &Pr) -> Option<(usize, Source)> {
+        self.feeds
+            .iter()
+            .position(|f| f.prs.iter().any(|q| q.url == p.url))
+            .map(|i| (i, self.feeds[i].source.clone()))
+    }
+
+    /// Shows who reviews the PR under the cursor, and loads who can.
+    fn pick_reviewers(&mut self) {
+        let Some(p) = self.selected().cloned() else {
+            return;
+        };
+        let Some((i, source)) = self.source_of(&p) else {
+            return;
+        };
+        let mut known: Vec<String> = self.feeds[i].prs.iter().map(|q| q.author.clone()).collect();
+        known.sort();
+        known.dedup();
+        let (tx, load, pr) = (self.tx.clone(), self.load_reviewers, p.clone());
+        thread::spawn(move || {
+            let result = load(&source, &pr, &known).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Msg::ReviewersLoaded(pr.url, result));
+        });
+        self.mode = Mode::Reviewers(Box::new(Picker::new(p)));
+    }
+
+    fn on_reviewers_key(&mut self, mut picker: Box<Picker>, key: KeyEvent) {
+        match picker.on_key(key) {
+            reviewers::Action::None => {}
+            reviewers::Action::Close => return,
+            reviewers::Action::Save(change) => {
+                let Some((_, source)) = self.source_of(&picker.pr) else {
+                    picker.error = Some("The PR is gone from the table".into());
+                    self.mode = Mode::Reviewers(picker);
+                    return;
+                };
+                picker.saving = true;
+                let (tx, save, pr) = (self.tx.clone(), self.save_reviewers, picker.pr.clone());
+                thread::spawn(move || {
+                    let result = save(&source, &pr, &change).map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(Msg::ReviewersSaved(pr.url, result));
+                });
+            }
+        }
+        self.mode = Mode::Reviewers(picker);
+    }
+
+    fn reviewers_loaded(&mut self, url: String, result: Result<Reviewers, String>) {
+        if let Mode::Reviewers(picker) = &mut self.mode
+            && picker.pr.url == url
+        {
+            picker.loaded(result);
+        }
+    }
+
+    fn reviewers_saved(&mut self, url: String, result: Result<(), String>) {
+        let Mode::Reviewers(picker) = &mut self.mode else {
+            return;
+        };
+        if picker.pr.url != url {
+            return;
+        }
+        picker.saving = false;
+        if let Err(error) = result {
+            picker.error = Some(error);
+            return;
+        }
+        let done = picker.change().describe(true);
+        let title = format!("Reviewers of {} #{}", picker.pr.repo, picker.pr.number);
+        let pr = picker.pr.clone();
+        self.mode = Mode::Table;
+        // Capitalized, as it starts the message
+        let mut message = done;
+        if let Some(first) = message.get_mut(..1) {
+            first.make_ascii_uppercase();
+        }
+        self.notify(title, message, false, COPIED_TIMEOUT);
+        // Load its source again, so the table shows the change
+        if let Some((i, _)) = self.source_of(&pr)
+            && self.feeds[i].state != State::Loading
+        {
+            self.fetch(i);
+        }
     }
 
     fn previewed(&mut self, url: String, result: Result<Preview, String>) {
@@ -1039,6 +1137,7 @@ impl App {
             Mode::Help => draw_help(frame, body),
             Mode::Search => {}
             Mode::Preview(_) => self.draw_preview(frame, body),
+            Mode::Reviewers(picker) => picker.draw(frame, body),
         }
         self.draw_toasts(frame, body);
     }
@@ -1642,6 +1741,89 @@ mod tests {
         );
         answer(&mut app);
         assert!(!text(&mut app).contains("loading…"));
+    }
+
+    /// Handles the next message from a background load or save.
+    fn answer(app: &mut App, rx: &Receiver<Msg>) {
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Msg::Loaded(id, result) => app.loaded(id, result),
+            Msg::Previewed(url, result) => app.previewed(url, result),
+            Msg::ReviewersLoaded(url, result) => app.reviewers_loaded(url, result),
+            Msg::ReviewersSaved(url, result) => app.reviewers_saved(url, result),
+            Msg::Input(_) => panic!("no input in tests"),
+        }
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    fn reviewers_app() -> (App, Receiver<Msg>) {
+        let (mut app, rx) = app(Group::Repo, vec![github()]);
+        app.load_reviewers = |_, _, known| {
+            Ok(Reviewers {
+                requested: vec!["chidi".into()],
+                people: known.to_vec(),
+                verdicts: HashMap::new(),
+            })
+        };
+        app.loaded(
+            0,
+            Ok(vec![
+                pr("GitHub", "a", 1, "amy", Status::Needs),
+                pr("GitHub", "a", 2, "bao", Status::Needs),
+            ]),
+        );
+        (app, rx)
+    }
+
+    #[test]
+    fn v_asks_for_a_review_and_loads_the_source_again() {
+        let (mut app, rx) = reviewers_app();
+        app.save_reviewers = |_, _, change| {
+            assert_eq!(change.add, ["bao"]);
+            Ok(())
+        };
+        app.on_key(key(KeyCode::Char('v')));
+        assert!(screen(&mut app, 80, 24).join("\n").contains("Loading…"));
+        answer(&mut app, &rx);
+        let shown = screen(&mut app, 80, 24).join("\n");
+        assert!(shown.contains(" Reviewers of acme/a #1 "), "{shown}");
+        assert!(shown.contains("│ ✓ chidi  asked"), "{shown}");
+
+        type_text(&mut app, "ba");
+        app.on_key(key(KeyCode::Enter));
+        assert!(screen(&mut app, 80, 24).join("\n").contains("Saving…"));
+        answer(&mut app, &rx);
+        assert!(matches!(app.mode, Mode::Table));
+        assert_eq!(app.toasts[0].title, "Reviewers of acme/a #1");
+        assert_eq!(app.toasts[0].message, "Asked bao");
+        assert_eq!(app.feeds[0].state, State::Loading);
+    }
+
+    #[test]
+    fn a_failed_save_shows_why_and_keeps_the_panel() {
+        let (mut app, rx) = reviewers_app();
+        app.save_reviewers =
+            |_, _, _| anyhow::bail!("Reviews may only be requested from collaborators");
+        app.on_key(key(KeyCode::Char('v')));
+        answer(&mut app, &rx);
+        type_text(&mut app, "zed");
+        let shown = screen(&mut app, 80, 24).join("\n");
+        assert!(shown.contains("  zed (as typed)"), "{shown}");
+        app.on_key(key(KeyCode::Enter));
+        answer(&mut app, &rx);
+        let shown = screen(&mut app, 80, 24).join("\n");
+        assert!(matches!(app.mode, Mode::Reviewers(_)));
+        assert!(
+            shown.contains("Reviews may only be requested from"),
+            "{shown}"
+        );
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Table));
     }
 
     #[test]

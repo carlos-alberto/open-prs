@@ -12,6 +12,7 @@ status and comments, and shows which PRs are stacked on which.
 - PRs that changed since you last saw them are bold, and marked `new`
 - `p` previews a PR: its description, the checks that didn't pass, the files and the last
   comments
+- `v` asks people to review a PR, or stops asking them
 - Stacked PRs show as a tree under the PR they are on
 - Filters for your PRs, approved PRs, PRs that need review, review requests, new PRs,
   failing CI and drafts, and a text filter
@@ -51,6 +52,7 @@ changes the words. It reloads every SECONDS (default 60).
 | `enter`, `o`, click the cursor row | Open the PR in the browser, and mark it as seen |
 | `p` | Preview the PR, and mark it as seen |
 | `c` | Open the PR's CI runs |
+| `v` | Ask people to review the PR, or stop asking them |
 | `/` | Filter by words in the repo, number, title, author or host; `enter` keeps them, `esc` clears them |
 | `esc` | Clear the words |
 | `y` | Copy the PR's URL |
@@ -131,6 +133,21 @@ didn't pass, the files it changes, and its last 10 comments and reviews. `↑` `
 It loads each time it opens, and shows the last preview of that PR while it loads. On
 Forgejo and Gitea, tea doesn't give the files or each check, so the preview shows the CI
 state of them all.
+
+## Reviewers
+
+`v` shows who the PR asks for a review, with a tick, and the people who can review it. Type
+to filter the names, `space` ticks or unticks the name under the cursor, and `enter` saves.
+With nothing ticked yet, `enter` ticks the name under the cursor first, so `v`, a name and
+`enter` asks one person. A name that isn't in the list shows as typed, for someone it
+doesn't know or a GitHub team as `org/team`.
+
+![The reviewers of a PR: it asks bao, and dana is ticked](docs/reviewers.svg)
+
+The host tells each person it asks, so the panel says what `enter` does before you press
+it. On GitHub, the people are GitHub's suggestions, then the users who can be assigned in
+the repo. tea can't list who can review on Forgejo and Gitea, so there the people are the
+authors of the source's PRs and the PR's reviewers.
 
 ## Sources
 

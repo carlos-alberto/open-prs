@@ -35,6 +35,8 @@ fn demo() -> App {
     let mut app = App::new(options, sources, Origin::File(config), Seen::memory(), tx);
     app.load = |_| Ok(Vec::new());
     app.load_preview = |_, _| Ok(preview(Utc::now()));
+    app.load_reviewers = |_, _, _| Ok(Reviewers::default());
+    app.save_reviewers = |_, _, _| Ok(());
     app.logins = || vec!["work".into()];
 
     let now = Utc::now();
@@ -208,6 +210,24 @@ fn screenshots() {
         view.loading = false;
     }
     save("preview", &mut app, 100, 30);
+
+    // Who api #418 asks, and dana ticked
+    app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    app.on_key(key('v'));
+    let url = app.selected().unwrap().url.clone();
+    let reviewers = Reviewers {
+        requested: vec!["bao".into()],
+        people: ["chidi", "bao", "dana", "erin", "sam"]
+            .map(String::from)
+            .into(),
+        verdicts: [("chidi".to_owned(), "commented")].into(),
+    };
+    app.reviewers_loaded(url, Ok(reviewers));
+    for _ in 0..2 {
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    }
+    app.on_key(key(' '));
+    save("reviewers", &mut app, 100, 18);
 }
 
 /// What the host says about api #418.

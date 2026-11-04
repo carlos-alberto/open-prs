@@ -13,6 +13,7 @@ use serde_json::Value;
 use crate::config::{Kind, Source};
 use crate::pr::{Ci, Pr, Status};
 use crate::preview::{self, Check, Comment, FileChange, Files, Preview};
+use crate::reviewers::{self as review, Reviewers};
 
 pub fn fetch(source: &Source) -> Result<Vec<Pr>> {
     match &source.kind {
@@ -26,6 +27,38 @@ pub fn preview(source: &Source, pr: &Pr) -> Result<Preview> {
     match &source.kind {
         Kind::GitHub { hostname, .. } => github_preview(&pr.url, hostname.as_deref()),
         Kind::Forgejo { login, .. } => forgejo_preview(login, &pr.repo, pr.number),
+    }
+}
+
+/// Who reviews `pr`, which `source` found, and who can. `known` is the people in the
+/// source's PRs, for Forgejo, which tea can't ask who can review.
+pub fn reviewers(source: &Source, pr: &Pr, known: &[String]) -> Result<Reviewers> {
+    match &source.kind {
+        Kind::GitHub { hostname, .. } => github_reviewers(&pr.url, hostname.as_deref()),
+        Kind::Forgejo { login, .. } => forgejo_reviewers(login, pr, known),
+    }
+}
+
+/// Asks for the reviews in `change.add` and stops asking for the ones in `change.remove`.
+pub fn request_reviews(source: &Source, pr: &Pr, change: &review::Change) -> Result<()> {
+    match &source.kind {
+        Kind::GitHub { hostname, .. } => {
+            for args in github_review_calls(&pr.repo, pr.number, change) {
+                let mut cmd = vec!["gh", "api"];
+                if let Some(hostname) = hostname {
+                    cmd.extend(["--hostname", hostname]);
+                }
+                cmd.extend(args.iter().map(String::as_str));
+                run(&cmd)?;
+            }
+            Ok(())
+        }
+        Kind::Forgejo { login, .. } => {
+            let args = forgejo_review_args(login, &pr.repo, pr.number, change);
+            let mut cmd = vec!["tea"];
+            cmd.extend(args.iter().map(String::as_str));
+            run(&cmd).map(|_| ())
+        }
     }
 }
 
@@ -498,6 +531,176 @@ fn parse_github_preview(out: &str) -> Result<Preview> {
     })
 }
 
+const GITHUB_REVIEWERS_QUERY: &str = "
+query($url: URI!) {
+  resource(url: $url) { ... on PullRequest {
+    author { login }
+    reviewRequests(first: 50) { nodes { requestedReviewer {
+      __typename
+      ... on User { login }
+      ... on Team { slug organization { login } }
+    } } }
+    latestReviews(first: 50) { nodes { author { login } state } }
+    suggestedReviewers { reviewer { login } }
+    repository { assignableUsers(first: 100) { nodes { login } } }
+  } }
+}";
+
+#[derive(Deserialize)]
+struct GhReviewersPage {
+    data: GhReviewersData,
+}
+
+#[derive(Deserialize)]
+struct GhReviewersData {
+    resource: Option<GhReviewersPr>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhReviewersPr {
+    author: Option<GhLogin>,
+    review_requests: GhNodes<GhRequest>,
+    latest_reviews: GhNodes<GhLatestReview>,
+    suggested_reviewers: Vec<GhSuggested>,
+    repository: GhAssignable,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhRequest {
+    requested_reviewer: Option<GhRequested>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "__typename")]
+enum GhRequested {
+    User {
+        login: String,
+    },
+    Team {
+        slug: String,
+        organization: GhLogin,
+    },
+    /// A bot or a mannequin
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+struct GhLatestReview {
+    author: Option<GhLogin>,
+    state: String,
+}
+
+#[derive(Deserialize)]
+struct GhSuggested {
+    reviewer: GhLogin,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhAssignable {
+    assignable_users: GhNodes<GhLogin>,
+}
+
+fn github_reviewers(url: &str, hostname: Option<&str>) -> Result<Reviewers> {
+    let query = format!("query={GITHUB_REVIEWERS_QUERY}");
+    let url_field = format!("url={url}");
+    let mut cmd = vec!["gh", "api"];
+    if let Some(hostname) = hostname {
+        cmd.extend(["--hostname", hostname]);
+    }
+    cmd.extend(["graphql", "-f", &query, "-f", &url_field]);
+    parse_github_reviewers(&run(&cmd)?)
+}
+
+fn parse_github_reviewers(out: &str) -> Result<Reviewers> {
+    let page: GhReviewersPage =
+        serde_json::from_str(out).context("could not read the reply from gh")?;
+    let pr = page.data.resource.context("gh found no such PR")?;
+    let author = pr.author.map(|a| a.login);
+    let requested = pr
+        .review_requests
+        .nodes
+        .into_iter()
+        .filter_map(|r| match r.requested_reviewer? {
+            GhRequested::User { login } => Some(login),
+            GhRequested::Team { slug, organization } => {
+                Some(format!("{}/{slug}", organization.login))
+            }
+            GhRequested::Other => None,
+        })
+        .collect();
+    let verdicts = pr
+        .latest_reviews
+        .nodes
+        .into_iter()
+        .filter_map(|r| {
+            let verdict = match r.state.as_str() {
+                "APPROVED" => "approved",
+                "CHANGES_REQUESTED" => "changes requested",
+                "COMMENTED" => "commented",
+                "DISMISSED" => "dismissed",
+                _ => return None,
+            };
+            Some((r.author?.login, verdict))
+        })
+        .collect();
+    let mut people: Vec<String> = Vec::new();
+    let names = pr
+        .suggested_reviewers
+        .into_iter()
+        .map(|s| s.reviewer.login)
+        .chain(
+            pr.repository
+                .assignable_users
+                .nodes
+                .into_iter()
+                .map(|u| u.login),
+        );
+    for name in names {
+        if Some(&name) != author.as_ref() && !people.contains(&name) {
+            people.push(name);
+        }
+    }
+    Ok(Reviewers {
+        requested,
+        people,
+        verdicts,
+    })
+}
+
+/// The `gh api` calls that make `change`: a team is org/slug, and GitHub wants the slug.
+fn github_review_calls(repo: &str, number: u64, change: &review::Change) -> Vec<Vec<String>> {
+    let endpoint = format!("repos/{repo}/pulls/{number}/requested_reviewers");
+    let call = |method: &str, names: &[String]| {
+        let mut args = vec!["-X".to_owned(), method.to_owned(), endpoint.clone()];
+        let (teams, users): (Vec<&String>, Vec<&String>) =
+            names.iter().partition(|n| n.contains('/'));
+        // GitHub wants reviewers, if only empty
+        if users.is_empty() {
+            args.extend(["-f".into(), "reviewers[]".into()]);
+        }
+        for user in users {
+            args.extend(["-f".into(), format!("reviewers[]={user}")]);
+        }
+        for team in teams {
+            let slug = team.rsplit('/').next().unwrap_or(team);
+            args.extend(["-f".into(), format!("team_reviewers[]={slug}")]);
+        }
+        args
+    };
+    let mut calls = Vec::new();
+    if !change.add.is_empty() {
+        calls.push(call("POST", &change.add));
+    }
+    if !change.remove.is_empty() {
+        calls.push(call("DELETE", &change.remove));
+    }
+    calls
+}
+
 fn github_ci(state: &str) -> Option<Ci> {
     match state {
         "SUCCESS" => Some(Ci::Passed),
@@ -576,6 +779,9 @@ struct TeaReview {
 /// A PR on its own, with --comments.
 #[derive(Deserialize, Default)]
 struct TeaPullDetail {
+    /// Its author
+    #[serde(default)]
+    user: String,
     #[serde(default)]
     body: String,
     #[serde(default)]
@@ -590,6 +796,77 @@ struct TeaComment {
     created: DateTime<Utc>,
     #[serde(default)]
     body: String,
+}
+
+fn forgejo_reviewers(login: &str, pr: &Pr, known: &[String]) -> Result<Reviewers> {
+    let number = pr.number.to_string();
+    let pull: TeaPullDetail = tea(login, &["pulls", &number, "--repo", &pr.repo])?;
+    Ok(forgejo_reviewers_from(pull, known))
+}
+
+/// Who it asks now, from each reviewer's last entry, and what they said last. tea can't ask
+/// who can review, so the people are the ones it knows from the PRs.
+fn forgejo_reviewers_from(pull: TeaPullDetail, known: &[String]) -> Reviewers {
+    let reviews = pull.reviews.unwrap_or_default();
+    let mut last: HashMap<&str, &str> = HashMap::new();
+    let mut verdicts = HashMap::new();
+    for r in by_id(&reviews) {
+        last.insert(&r.reviewer, &r.state);
+        let verdict = match r.state.as_str() {
+            "APPROVED" => "approved",
+            "REQUEST_CHANGES" => "changes requested",
+            "COMMENT" => "commented",
+            _ => continue,
+        };
+        verdicts.insert(r.reviewer.clone(), verdict);
+    }
+    let mut requested: Vec<String> = last
+        .into_iter()
+        .filter(|(_, state)| *state == "REQUEST_REVIEW")
+        .map(|(name, _)| name.to_owned())
+        .collect();
+    requested.sort();
+    let mut people: Vec<String> = known
+        .iter()
+        .cloned()
+        .chain(reviews.iter().map(|r| r.reviewer.clone()))
+        .filter(|n| *n != pull.user && !n.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    people.retain(|n| !requested.contains(n));
+    Reviewers {
+        requested,
+        people,
+        verdicts,
+    }
+}
+
+fn forgejo_review_args(
+    login: &str,
+    repo: &str,
+    number: u64,
+    change: &review::Change,
+) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "pulls",
+        "edit",
+        &number.to_string(),
+        "--repo",
+        repo,
+        "--login",
+        login,
+    ]
+    .map(String::from)
+    .into();
+    // Long flags only: tea gives -r to both --repo and --add-reviewers
+    if !change.add.is_empty() {
+        args.extend(["--add-reviewers".into(), change.add.join(",")]);
+    }
+    if !change.remove.is_empty() {
+        args.extend(["--remove-reviewers".into(), change.remove.join(",")]);
+    }
+    args
 }
 
 fn forgejo_preview(login: &str, repo: &str, number: u64) -> Result<Preview> {
@@ -923,6 +1200,106 @@ mod tests {
         assert_eq!(
             comments,
             [("ghost", None), ("bao", None), ("amy", Some("approved"))]
+        );
+    }
+
+    #[test]
+    fn github_reviewers_lists_requests_verdicts_and_people() {
+        let out = r#"{"data":{"resource":{
+          "author":{"login":"amy"},
+          "reviewRequests":{"nodes":[
+            {"requestedReviewer":{"__typename":"User","login":"bao"}},
+            {"requestedReviewer":{"__typename":"Team","slug":"api","organization":{"login":"acme"}}},
+            {"requestedReviewer":{"__typename":"Mannequin"}},
+            {"requestedReviewer":null}]},
+          "latestReviews":{"nodes":[
+            {"author":{"login":"chidi"},"state":"CHANGES_REQUESTED"},
+            {"author":{"login":"dana"},"state":"PENDING"}]},
+          "suggestedReviewers":[{"reviewer":{"login":"chidi"}}],
+          "repository":{"assignableUsers":{"nodes":[
+            {"login":"amy"},{"login":"bao"},{"login":"chidi"},{"login":"erin"}]}}
+        }}}"#;
+        let r = parse_github_reviewers(out).unwrap();
+        assert_eq!(r.requested, ["bao", "acme/api"]);
+        // The suggestions first, and not the author
+        assert_eq!(r.people, ["chidi", "bao", "erin"]);
+        assert_eq!(
+            r.verdicts,
+            HashMap::from([("chidi".into(), "changes requested")])
+        );
+    }
+
+    #[test]
+    fn github_review_calls_post_and_delete_with_teams_as_slugs() {
+        let change = review::Change {
+            add: vec!["bao".into(), "acme/api".into()],
+            remove: vec!["acme/web".into()],
+        };
+        let calls = github_review_calls("acme/api", 418, &change);
+        let endpoint = "repos/acme/api/pulls/418/requested_reviewers";
+        assert_eq!(
+            calls,
+            [
+                vec![
+                    "-X",
+                    "POST",
+                    endpoint,
+                    "-f",
+                    "reviewers[]=bao",
+                    "-f",
+                    "team_reviewers[]=api"
+                ],
+                vec![
+                    "-X",
+                    "DELETE",
+                    endpoint,
+                    "-f",
+                    "reviewers[]",
+                    "-f",
+                    "team_reviewers[]=web"
+                ],
+            ]
+        );
+        assert!(github_review_calls("acme/api", 418, &review::Change::default()).is_empty());
+    }
+
+    #[test]
+    fn forgejo_reviewers_come_from_each_reviewers_last_entry() {
+        let pull: TeaPullDetail = serde_json::from_str(
+            r#"{"user":"dana","reviews":[
+              {"id":1,"reviewer":"erin","state":"REQUEST_REVIEW"},
+              {"id":2,"reviewer":"erin","state":"APPROVED"},
+              {"id":3,"reviewer":"bao","state":"COMMENT"},
+              {"id":4,"reviewer":"bao","state":"REQUEST_REVIEW"}]}"#,
+        )
+        .unwrap();
+        let known = ["dana".to_owned(), "sam".to_owned(), "bao".to_owned()];
+        let r = forgejo_reviewers_from(pull, &known);
+        assert_eq!(r.requested, ["bao"]);
+        assert_eq!(r.people, ["erin", "sam"]);
+        assert_eq!(
+            r.verdicts,
+            HashMap::from([("erin".into(), "approved"), ("bao".into(), "commented")])
+        );
+        let change = review::Change {
+            add: vec!["sam".into(), "erin".into()],
+            remove: vec!["bao".into()],
+        };
+        assert_eq!(
+            forgejo_review_args("work", "acme/docs", 23, &change),
+            [
+                "pulls",
+                "edit",
+                "23",
+                "--repo",
+                "acme/docs",
+                "--login",
+                "work",
+                "--add-reviewers",
+                "sam,erin",
+                "--remove-reviewers",
+                "bao"
+            ]
         );
     }
 
