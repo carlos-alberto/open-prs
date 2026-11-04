@@ -37,6 +37,11 @@ checks. The Notes column says when a PR asks for your review (`for you`, which o
 includes requests to your teams), is a `draft`, or has a `conflict` with its base branch.
 Drafts are dim.
 
+The Comments column has the number that the host shows next to the PR in its own list, and
+is blank for none. GitHub counts the comments in the conversation and the inline comments
+on the code. Forgejo counts each comment in the conversation and each review, also an
+approval with no text, but not the inline comments.
+
 A PR whose base is another open PR's branch is stacked on it, and that PR merges first.
 Grouped by repo, a stacked PR shows under the PR it is on, joined to it by lines:
 
@@ -54,8 +59,8 @@ it is on, the Notes column says `on #N`. A branch from a fork can't have PRs sta
 checks page per PR.
 
 When stdout isn't a terminal, it prints one tab-separated line per PR instead:
-host, repo, number, status, author, title, url, ci, notes. The notes have commas between
-them. It exits 1 if a source failed.
+host, repo, number, status, author, title, url, ci, notes, comments. The notes have
+commas between them. It exits 1 if a source failed.
 
 ## Sources
 

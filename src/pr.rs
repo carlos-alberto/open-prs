@@ -129,6 +129,8 @@ pub struct Pr {
     pub requested: bool,
     pub draft: bool,
     pub conflict: bool,
+    /// What the host counts as comments; see the README
+    pub comments: u64,
     /// The branch it merges into
     pub base: String,
     /// Its branch, or empty when that is in another repo, as then nothing here can stack on it
@@ -381,6 +383,7 @@ pub mod tests {
             requested: false,
             draft: false,
             conflict: false,
+            comments: 0,
             base: "main".into(),
             head: format!("branch-{number}"),
             parent: None,

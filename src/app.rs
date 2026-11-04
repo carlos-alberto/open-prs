@@ -731,11 +731,12 @@ impl App {
         let by_repo = self.group == Group::Repo;
         let headers: &[&str] = if by_repo {
             &[
-                "Repo", "Host", "#", "Status", "CI", "Notes", "Author", "Updated", "Title",
+                "Repo", "Host", "#", "Status", "CI", "Notes", "Author", "Comments", "Updated",
+                "Title",
             ]
         } else {
             &[
-                "Author", "Host", "PR", "Status", "CI", "Notes", "Updated", "Title",
+                "Author", "Host", "PR", "Status", "CI", "Notes", "Comments", "Updated", "Title",
             ]
         };
         let owner = self.owner.as_deref();
@@ -795,7 +796,16 @@ impl App {
                     notes,
                 ]);
             }
-            row.extend([Line::raw(age(p.updated, now)), Line::raw(p.title.clone())]);
+            // Blank for none, so the PRs with comments stand out
+            let comments = match p.comments {
+                0 => Line::default(),
+                n => Line::raw(n.to_string()).right_aligned(),
+            };
+            row.extend([
+                comments,
+                Line::raw(age(p.updated, now)),
+                Line::raw(p.title.clone()),
+            ]);
             cells.push(row);
         }
 
@@ -1239,6 +1249,7 @@ mod tests {
         app.feeds[0].prs[0].conflict = true;
         app.feeds[0].prs[1].ci = Some(Ci::Passed);
         app.feeds[0].prs[2].draft = true;
+        app.feeds[0].prs[0].comments = 12;
         app.show();
         app.notify(
             "GitHub failed".into(),
@@ -1261,6 +1272,10 @@ mod tests {
         assert!(lines[4].starts_with(
             "web      GitHub  #1207  changes requested           draft             zed"
         ));
+        // Comments are right-aligned under their 8-wide header, and blank for none
+        assert!(lines[1].contains("Author  Comments  Updated"));
+        assert!(lines[2].contains(&format!("amy{}12  2965w", " ".repeat(11))));
+        assert!(lines[3].contains(&format!("me{}2965w", " ".repeat(16))));
         assert!(lines.iter().any(|l| l.contains(" GitHub failed ")));
         assert!(lines[11].starts_with(" o  Open"));
         assert!(lines[11].contains(" s  Sources"));

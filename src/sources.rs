@@ -64,6 +64,8 @@ query($q: String!, $endCursor: String) {
       repository { nameWithOwner }
       headRepository { nameWithOwner }
       latestOpinionatedReviews(first: 20) { nodes { state } }
+      comments { totalCount }
+      reviewThreads(first: 100) { nodes { comments { totalCount } } }
       commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
     } }
   }
@@ -128,6 +130,26 @@ struct GhPr {
     head_repository: Option<GhRepo>,
     latest_opinionated_reviews: GhReviews,
     commits: GhCommits,
+    /// In the conversation
+    comments: GhCount,
+    /// Each holds inline comments on the code
+    review_threads: GhThreads,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhCount {
+    total_count: u64,
+}
+
+#[derive(Deserialize)]
+struct GhThreads {
+    nodes: Vec<GhThread>,
+}
+
+#[derive(Deserialize)]
+struct GhThread {
+    comments: GhCount,
 }
 
 #[derive(Deserialize)]
@@ -256,6 +278,13 @@ fn parse_github(name: &str, out: &str) -> Result<Vec<Pr>> {
                 requested: false,
                 draft: n.is_draft,
                 conflict: n.mergeable == "CONFLICTING",
+                // As GitHub counts them in its list of PRs
+                comments: n.comments.total_count
+                    + n.review_threads
+                        .nodes
+                        .iter()
+                        .map(|t| t.comments.total_count)
+                        .sum::<u64>(),
                 base: n.base_ref_name,
                 head,
                 parent: None,
@@ -325,6 +354,9 @@ struct TeaRepoPull {
     /// Its branch; the PR on its own gives refs/pull/N/head in its place
     #[serde(default)]
     head: String,
+    /// Forgejo's count: each comment in the conversation and each review counts once
+    #[serde(default)]
+    comments: String,
 }
 
 #[derive(Deserialize)]
@@ -397,6 +429,7 @@ fn forgejo(name: &str, login: &str, owner: Option<&str>) -> Result<Vec<Pr>> {
             requested: forgejo_requested(&reviews, &me),
             draft,
             conflict: pull.mergeable == Some(false) && !draft,
+            comments: 0,
             base: String::new(),
             head: String::new(),
             parent: None,
@@ -432,6 +465,7 @@ fn forgejo(name: &str, login: &str, owner: Option<&str>) -> Result<Vec<Pr>> {
         pr.ci = forgejo_ci_state(&listed.ci);
         pr.base = listed.base.clone();
         pr.head = forgejo_head(&listed.head);
+        pr.comments = listed.comments.parse().unwrap_or(0);
     }
     Ok(prs)
 }
@@ -456,7 +490,7 @@ fn forgejo_repo_pulls(login: &str, repo: &str) -> Result<HashMap<String, TeaRepo
                 "--page",
                 &page,
                 "--fields",
-                "index,ci,base,head",
+                "index,ci,base,head,comments",
             ],
         )?;
         let last = batch.len() < 50;
@@ -624,6 +658,15 @@ mod tests {
                 2 => (true, "CONFLICTING"),
                 _ => (false, "UNKNOWN"),
             };
+            // Two conversation comments on 1, and threads of 2 and 1 inline comments on 3
+            let (talk, threads) = match number {
+                1 => (2, ""),
+                3 => (
+                    0,
+                    r#"{"comments":{"totalCount":2}},{"comments":{"totalCount":1}}"#,
+                ),
+                _ => (0, ""),
+            };
             // 2 is from a fork, and 3's fork is gone
             let head_repo = match number {
                 1 => r#"{"nameWithOwner":"acme/r"}"#,
@@ -636,7 +679,7 @@ mod tests {
                 _ => "",
             };
             format!(
-                r#"{{"number":{number},"title":"t","url":"u{number}","reviewDecision":{decision},"updatedAt":"2026-11-04T09:07:15Z","isDraft":{draft},"mergeable":"{mergeable}","baseRefName":"main","headRefName":"b{number}","author":{author},"repository":{{"nameWithOwner":"acme/r"}},"headRepository":{head_repo},"latestOpinionatedReviews":{{"nodes":[{reviews}]}},"commits":{{"nodes":[{commits}]}}}}"#
+                r#"{{"number":{number},"title":"t","url":"u{number}","reviewDecision":{decision},"updatedAt":"2026-11-04T09:07:15Z","isDraft":{draft},"mergeable":"{mergeable}","baseRefName":"main","headRefName":"b{number}","author":{author},"repository":{{"nameWithOwner":"acme/r"}},"headRepository":{head_repo},"latestOpinionatedReviews":{{"nodes":[{reviews}]}},"commits":{{"nodes":[{commits}]}},"comments":{{"totalCount":{talk}}},"reviewThreads":{{"nodes":[{threads}]}}}}"#
             )
         };
         let out = format!(
@@ -686,6 +729,8 @@ mod tests {
             ]
         );
         assert_eq!(prs[0].checks_url, "u1/checks");
+        let comments: Vec<_> = prs.iter().map(|p| p.comments).collect();
+        assert_eq!(comments, [2, 0, 3]);
         let branches: Vec<_> = prs
             .iter()
             .map(|p| (p.base.as_str(), p.head.as_str()))

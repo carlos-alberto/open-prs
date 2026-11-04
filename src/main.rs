@@ -8,7 +8,7 @@
 //! enter/o open the PR in the browser, y copy its URL, r reload now, q quit.
 //!
 //! When stdout isn't a terminal it prints one tab-separated line per PR instead:
-//! host, repo, number, status, author, title, url, ci, notes.
+//! host, repo, number, status, author, title, url, ci, notes, comments.
 
 mod app;
 mod config;
@@ -38,7 +38,8 @@ use crate::pr::{Ci, Filter, Group, Note, Status, pick};
                   sources, ? every key, q quit.\n\
                   When stdout isn't a terminal, it prints one tab-separated line per PR: \
                   host, repo, number, status, author, title, url, ci (passed, failing, pending \
-                  or empty), notes (for you, draft and conflict, with commas between)."
+                  or empty), notes (for you, draft, conflict and on #N, with commas between), \
+                  comments."
 )]
 struct Args {
     /// Only PRs you opened
@@ -145,7 +146,8 @@ fn plain(sources: &[Source], filter: &Filter, group: Group) -> ExitCode {
         let notes: Vec<_> = p.notes().into_iter().map(Note::label).collect();
         let notes = notes.join(",");
         // New columns go last, so the ones before them stay where they were
-        let fields: [&str; 9] = [
+        let comments = p.comments.to_string();
+        let fields: [&str; 10] = [
             &p.host,
             &p.repo,
             &number,
@@ -155,6 +157,7 @@ fn plain(sources: &[Source], filter: &Filter, group: Group) -> ExitCode {
             &p.url,
             p.ci.map_or("", Ci::label),
             &notes,
+            &comments,
         ];
         // Stop quietly when the reader goes away, as with `| head`
         if writeln!(out, "{}", fields.join("\t")).is_err() {
