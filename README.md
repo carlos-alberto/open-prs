@@ -7,9 +7,12 @@ status and comments, and shows which PRs are stacked on which.
 
 - One list for many GitHub searches and Forgejo or Gitea logins
 - Review status, CI, review requests for you, drafts and merge conflicts
+- PRs that changed since you last saw them are bold, and marked `new`
+- `p` previews a PR: its description, the checks that didn't pass, the files and the last
+  comments
 - Stacked PRs show as a tree under the PR they are on
-- Filters for your PRs, approved PRs, PRs that need review, review requests, failing CI and
-  drafts, and a text filter
+- Filters for your PRs, approved PRs, PRs that need review, review requests, new PRs,
+  failing CI and drafts, and a text filter
 - `enter` opens the PR, `c` opens its CI runs and `y` copies its URL
 - Add, edit and delete sources in the TUI; changes save to the config file and keep its
   comments
@@ -32,18 +35,19 @@ This puts `open_prs` in `~/.cargo/bin`. It needs:
 ## Usage
 
 ```
-open_prs [-m/--mine] [-a/--approved | -n/--needs-review] [-w/--for-you] [-f/--failing]
-         [-d/--hide-drafts] [--text WORDS] [-g/--group repo|user] [-i/--interval SECONDS]
-         [--github QUERY]... [--forgejo LOGIN]...
+open_prs [-m/--mine] [-a/--approved | -n/--needs-review] [-w/--for-you] [-u/--new]
+         [-f/--failing] [-d/--hide-drafts] [--text WORDS] [-g/--group repo|user]
+         [-i/--interval SECONDS] [--github QUERY]... [--forgejo LOGIN]...
 ```
 
 With no sources, it shows the PRs on github.com that involve you. The flags set how the TUI
-starts. The keys `m`, `a`, `n`, `w`, `f`, `d` and `g` toggle them while it runs, and `/`
+starts. The keys `m`, `a`, `n`, `w`, `u`, `f`, `d` and `g` toggle them while it runs, and `/`
 changes the words. It reloads every SECONDS (default 60).
 
 | Key | Action |
 |-----|--------|
-| `enter`, `o`, click the cursor row | Open the PR in the browser |
+| `enter`, `o`, click the cursor row | Open the PR in the browser, and mark it as seen |
+| `p` | Preview the PR, and mark it as seen |
 | `c` | Open the PR's CI runs |
 | `/` | Filter by words in the repo, number, title, author or host; `enter` keeps them, `esc` clears them |
 | `esc` | Clear the words |
@@ -52,10 +56,12 @@ changes the words. It reloads every SECONDS (default 60).
 | `m` | Only PRs you opened |
 | `a` / `n` | Only approved PRs / only PRs that need review |
 | `w` | Only PRs that ask for your review |
+| `u` | Only PRs that changed since you last saw them |
 | `f` | Only PRs with failing CI |
 | `d` | Hide drafts |
 | `g` | Group by repo or by author |
 | `s` | Add, edit and delete sources |
+| `space` | Mark the PR as seen, or as new again |
 | `↑` `↓` `PgUp` `PgDn` `Home` `End`, scroll | Move the cursor |
 | `←` `→`, sideways scroll | Scroll the columns; Repo and # stay |
 | `?` | Show every key |
@@ -66,9 +72,9 @@ The footer shows as many keys as fit, and `?` shows them all.
 ## The table
 
 The CI column is `passed`, `failing` or `pending`, and blank when the last commit has no
-checks. The Notes column says when a PR asks for your review (`for you`, which on GitHub
-includes requests to your teams), is a `draft`, or has a `conflict` with its base branch.
-Drafts are dim.
+checks. The Notes column says when a PR changed since you last saw it (`new`), asks for your
+review (`for you`, which on GitHub includes requests to your teams), is a `draft`, or has a
+`conflict` with its base branch. Drafts are dim.
 
 The Comments column has the number that the host shows next to the PR in its own list, and
 is blank for none. GitHub counts the comments in the conversation and the inline comments on
@@ -80,6 +86,18 @@ the owner when every PR has the same one. When two sources find the same PR, it 
 from the first source.
 
 On Forgejo, `c` opens the repo's list of action runs, as there is no checks page per PR.
+
+### New activity
+
+A PR is `new` when it changed since you last opened it or previewed it: a new commit,
+comment or review, or a new title. Its title is bold, and the header counts them. `u` shows
+only these, and `space` marks the PR under the cursor as seen, or as new again. A PR that
+opens is new too.
+
+The first time a source loads, its PRs count as seen, so a first run or a new source
+doesn't mark everything. `$XDG_STATE_HOME/open_prs/seen.json`, else
+`~/.local/state/open_prs/seen.json`, keeps when you last saw each PR. The host decides
+what counts as a change, so your own comments also make a PR new.
 
 ### Stacks
 
@@ -98,6 +116,19 @@ shortens `changes requested` to `changes`. Nothing else hides: `→` scrolls the
 brings them back.
 
 ![The same PRs in 92 columns, scrolled past Host, Status and CI](docs/narrow.svg)
+
+## Preview
+
+`p` shows the PR under the cursor: its description, the checks on its last commit that
+didn't pass, the files it changes, and its last 10 comments and reviews. `↑` `↓` `PgUp`
+`PgDn` scroll, `←` `→` go to the PR above or below in the table, and `esc` goes back. `o`,
+`c` and `y` work as in the table.
+
+![The preview of a PR with a pending check and three comments](docs/preview.svg)
+
+It loads each time it opens, and shows the last preview of that PR while it loads. On
+Forgejo and Gitea, tea doesn't give the files or each check, so the preview shows the CI
+state of them all.
 
 ## Sources
 
@@ -132,7 +163,7 @@ owner = "forgejo"              # only this user's or org's repos; without it, a 
 
 When stdout isn't a terminal, it prints one tab-separated line per PR instead: host, repo,
 number, status, author, title, url, ci, notes, comments. The notes have commas between them.
-It exits 1 if a source failed.
+It exits 1 if a source failed. It reads what you saw, for `new`, but doesn't change it.
 
 ```
 $ open_prs --github org:acme --failing | cut -f 1-5,8,9

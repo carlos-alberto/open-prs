@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -21,6 +21,8 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::config::{self, Change, Origin, Source};
 use crate::manage::{self, Form, FormAction, List, ListRow};
 use crate::pr::{Filter, Group, Note, Pr, Status, age, pick, shared_owner};
+use crate::preview::{self, Preview};
+use crate::seen::Seen;
 use crate::sources;
 
 const TITLE: &str = "Open PRs";
@@ -28,11 +30,13 @@ const COPIED_TIMEOUT: Duration = Duration::from_secs(5);
 const ERROR_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The keys in the footer, most useful first; it shows as many as fit.
-const FOOTER: [(&str, &str); 14] = [
+const FOOTER: [(&str, &str); 17] = [
     ("o", "Open"),
+    ("p", "Preview"),
     ("/", "Filter"),
     ("←→", "Columns"),
     ("c", "Checks"),
+    ("u", "New"),
     ("w", "For you"),
     ("f", "Failing CI"),
     ("m", "Mine"),
@@ -41,6 +45,7 @@ const FOOTER: [(&str, &str); 14] = [
     ("n", "Needs review"),
     ("d", "Drafts"),
     ("g", "Group"),
+    ("space", "Seen"),
     ("y", "Copy URL"),
     ("r", "Reload"),
 ];
@@ -148,8 +153,15 @@ impl TableLayout {
 }
 
 /// Every key, for the help panel.
-const HELP: [(&str, &str); 18] = [
-    ("enter, o", "Open the PR in the browser"),
+const HELP: [(&str, &str); 21] = [
+    (
+        "enter, o",
+        "Open the PR in the browser, and mark it as seen",
+    ),
+    (
+        "p",
+        "Preview the PR's description, checks, files and comments, and mark it as seen",
+    ),
     (
         "/",
         "Filter by words in the repo, number, title, author or host",
@@ -162,17 +174,20 @@ const HELP: [(&str, &str); 18] = [
     ("a", "Only approved PRs"),
     ("n", "Only PRs that need review"),
     ("w", "Only PRs that ask for your review"),
+    ("u", "Only PRs that changed since you last saw them"),
     ("f", "Only PRs with failing CI"),
     ("d", "Hide drafts"),
     ("g", "Group by repo or by author"),
     ("s", "Add, edit and delete sources"),
+    ("space", "Mark the PR as seen, or as new again"),
     ("↑ ↓ PgUp PgDn Home End", "Move the cursor"),
     ("← →", "Scroll the columns; the first two stay"),
     ("?", "Show this help"),
     ("q, ctrl+c", "Quit"),
 ];
 
-const NOTES_HELP: &str = "Notes: for you, the PR asks for your review; draft, it isn't ready; \
+const NOTES_HELP: &str = "Notes: new, the PR changed since you last saw it; for you, it asks \
+    for your review; draft, it isn't ready; \
     conflict, it can't merge; on #N, it is stacked on PR N, which merges first. Grouped by repo, \
     a stacked PR shows under the PR it is on.";
 
@@ -180,6 +195,8 @@ enum Msg {
     Input(io::Result<Event>),
     /// The PRs from the feed with this id
     Loaded(u64, Result<Vec<Pr>, String>),
+    /// The preview of the PR with this URL
+    Previewed(String, Result<Preview, String>),
 }
 
 /// A source and what it found.
@@ -189,6 +206,8 @@ struct Feed {
     source: Source,
     prs: Vec<Pr>,
     state: State,
+    /// Its next load is its first, which puts its PRs down as seen
+    start: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -206,6 +225,23 @@ enum Mode {
     Help,
     Sources(List),
     Form(Form),
+    Preview(Box<View>),
+}
+
+/// The preview of a PR, as it shows.
+struct View {
+    /// The PR as it was in the table
+    pr: Pr,
+    /// None while it loads the first time
+    content: Option<Result<Preview, String>>,
+    /// It shows an earlier preview while it loads again
+    loading: bool,
+    /// The first line that shows
+    scroll: usize,
+    /// The most `scroll` can be, from the last draw
+    max_scroll: usize,
+    /// The lines in a page, from the last draw
+    page: usize,
 }
 
 struct Toast {
@@ -236,10 +272,17 @@ pub struct App {
     /// Where the table was last drawn, to map mouse clicks to rows
     table_area: Rect,
     toasts: Vec<Toast>,
+    /// The last preview of each PR, to show while it loads again
+    previews: HashMap<String, Preview>,
+    seen: Seen,
+    /// It said it could not save what you saw, so it doesn't say so on each change
+    seen_failed: bool,
     tx: Sender<Msg>,
     quit: bool,
     /// Loads a source; the tests replace it, so they don't run gh or tea
     load: fn(&Source) -> Result<Vec<Pr>>,
+    /// Loads the preview of a PR that this source found; the tests replace it too
+    load_preview: fn(&Source, &Pr) -> Result<Preview>,
     /// The tea logins for the form's hint
     logins: fn() -> Vec<String>,
 }
@@ -250,9 +293,9 @@ pub struct Options {
     pub interval: Duration,
 }
 
-pub fn run(options: Options, sources: Vec<Source>, origin: Origin) -> Result<()> {
+pub fn run(options: Options, sources: Vec<Source>, origin: Origin, seen: Seen) -> Result<()> {
     let (tx, rx) = mpsc::channel();
-    let mut app = App::new(options, sources, origin, tx.clone());
+    let mut app = App::new(options, sources, origin, seen, tx.clone());
 
     let mut terminal = ratatui::init();
     let result = execute!(io::stdout(), EnableMouseCapture)
@@ -280,7 +323,15 @@ fn read_input(tx: Sender<Msg>) {
 }
 
 impl App {
-    fn new(options: Options, sources: Vec<Source>, origin: Origin, tx: Sender<Msg>) -> Self {
+    fn new(
+        options: Options,
+        sources: Vec<Source>,
+        origin: Origin,
+        seen: Seen,
+        tx: Sender<Msg>,
+    ) -> Self {
+        // Once it knows the PRs, the ones that opened since it last ran are new
+        let start = !seen.exists();
         let feeds = sources
             .into_iter()
             .zip(0..)
@@ -289,6 +340,7 @@ impl App {
                 source,
                 prs: Vec::new(),
                 state: State::Loaded,
+                start,
             })
             .collect::<Vec<_>>();
         App {
@@ -307,9 +359,13 @@ impl App {
             table: TableState::new(),
             table_area: Rect::default(),
             toasts: Vec::new(),
+            previews: HashMap::new(),
+            seen,
+            seen_failed: false,
             tx,
             quit: false,
             load: sources::fetch,
+            load_preview: sources::preview,
             // Without tea, the form shows no hint
             logins: || sources::tea_logins().unwrap_or_default(),
         }
@@ -331,6 +387,7 @@ impl App {
             match rx.recv_timeout(wake.saturating_duration_since(now)) {
                 Ok(Msg::Input(event)) => self.on_event(event?),
                 Ok(Msg::Loaded(id, result)) => self.loaded(id, result),
+                Ok(Msg::Previewed(url, result)) => self.previewed(url, result),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -378,8 +435,14 @@ impl App {
         let Some(feed) = self.feeds.iter_mut().find(|f| f.id == id) else {
             return;
         };
+        let mut started = false;
         match result {
             Ok(prs) => {
+                if feed.start {
+                    self.seen.start(&prs);
+                    feed.start = false;
+                    started = true;
+                }
                 feed.prs = prs;
                 feed.state = State::Loaded;
             }
@@ -393,6 +456,9 @@ impl App {
         if done {
             self.updated = Some(Local::now());
         }
+        if started {
+            self.save_seen();
+        }
         self.show();
         if done {
             self.follow = true;
@@ -403,6 +469,9 @@ impl App {
     fn show(&mut self) {
         let current = self.selected().map(|p| p.url.clone());
         let row = self.table.selected().unwrap_or(0);
+        for p in self.feeds.iter_mut().flat_map(|f| &mut f.prs) {
+            p.new = self.seen.is_new(p);
+        }
         let all = || self.feeds.iter().flat_map(|f| &f.prs);
         self.owner = shared_owner(all());
         self.rows = pick(all(), &self.filter, self.group);
@@ -423,6 +492,49 @@ impl App {
 
     fn selected(&self) -> Option<&Pr> {
         self.table.selected().and_then(|i| self.rows.get(i))
+    }
+
+    /// Marks the PR under the cursor as seen, or as new again with `toggle` when it is seen.
+    fn see(&mut self, toggle: bool) {
+        if let Some(p) = self.selected().cloned() {
+            self.see_pr(&p, toggle);
+        }
+    }
+
+    fn see_pr(&mut self, p: &Pr, toggle: bool) {
+        if toggle && !p.new {
+            self.seen.unmark(p);
+        } else {
+            self.seen.mark(p);
+        }
+        self.save_seen();
+        self.show();
+    }
+
+    fn save_seen(&mut self) {
+        // A source that didn't load is missing its PRs, which must not count as closed
+        let all_loaded = self.feeds.iter().all(|f| f.state == State::Loaded);
+        let open: HashSet<&str> = self
+            .feeds
+            .iter()
+            .flat_map(|f| &f.prs)
+            .map(|p| p.url.as_str())
+            .collect();
+        let result = self.seen.save(all_loaded.then_some(&open), Utc::now());
+        match result {
+            Ok(()) => self.seen_failed = false,
+            Err(e) if !self.seen_failed => {
+                self.seen_failed = true;
+                let message = format!("{e:#}");
+                self.notify(
+                    "Could not save what you saw".into(),
+                    message,
+                    true,
+                    ERROR_TIMEOUT,
+                );
+            }
+            Err(_) => {}
+        }
     }
 
     fn notify(&mut self, title: String, message: String, error: bool, timeout: Duration) {
@@ -447,6 +559,7 @@ impl App {
                     source,
                     prs: Vec::new(),
                     state: State::Loaded,
+                    start: true,
                 });
                 self.next_id += 1;
                 self.fetch(self.feeds.len() - 1);
@@ -458,6 +571,7 @@ impl App {
                     source,
                     prs: Vec::new(),
                     state: State::Loaded,
+                    start: true,
                 };
                 self.next_id += 1;
                 self.fetch(i);
@@ -474,6 +588,15 @@ impl App {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key(key),
             Event::Mouse(mouse) if matches!(self.mode, Mode::Table) => self.on_mouse(mouse),
+            Event::Mouse(mouse) => {
+                if let Mode::Preview(view) = &mut self.mode {
+                    match mouse.kind {
+                        MouseEventKind::ScrollDown => view.scroll_by(3),
+                        MouseEventKind::ScrollUp => view.scroll_by(-3),
+                        _ => {}
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -488,6 +611,7 @@ impl App {
             Mode::Sources(list) => self.on_sources_key(list, key),
             Mode::Form(form) => self.on_form_key(form, key),
             Mode::Search => self.on_search_key(key),
+            Mode::Preview(view) => self.on_preview_key(view, key),
             // Any key closes the help
             Mode::Help => {}
         }
@@ -497,7 +621,8 @@ impl App {
         let page = usize::from(self.table_area.height.saturating_sub(1)).max(1);
         match key.code {
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Enter | KeyCode::Char('o') => self.open(|p| &p.url),
+            KeyCode::Enter | KeyCode::Char('o') => self.open_pr(),
+            KeyCode::Char('p') => self.preview(),
             KeyCode::Char('c') => self.open(|p| &p.checks_url),
             KeyCode::Char('y') => self.copy_url(),
             KeyCode::Char('r') => self.reload(),
@@ -505,6 +630,8 @@ impl App {
             KeyCode::Char('a') => self.toggle_status(Status::Approved),
             KeyCode::Char('n') => self.toggle_status(Status::Needs),
             KeyCode::Char('w') => self.toggle(|f| &mut f.for_you),
+            KeyCode::Char('u') => self.toggle(|f| &mut f.new),
+            KeyCode::Char(' ') => self.see(true),
             KeyCode::Char('f') => self.toggle(|f| &mut f.failing),
             KeyCode::Char('d') => self.toggle(|f| &mut f.hide_drafts),
             KeyCode::Char('g') => {
@@ -528,6 +655,99 @@ impl App {
             KeyCode::End => self.move_cursor(isize::MAX),
             _ => {}
         }
+    }
+
+    /// Shows the preview of the PR under the cursor, which counts as seeing it, and loads it
+    /// again in the background.
+    fn preview(&mut self) {
+        let Some(p) = self.selected().cloned() else {
+            return;
+        };
+        // The first source that found it, as in the table
+        let Some(source) = self
+            .feeds
+            .iter()
+            .find(|f| f.prs.iter().any(|q| q.url == p.url))
+            .map(|f| f.source.clone())
+        else {
+            return;
+        };
+        let (tx, load, pr) = (self.tx.clone(), self.load_preview, p.clone());
+        thread::spawn(move || {
+            let result = load(&source, &pr).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Msg::Previewed(pr.url, result));
+        });
+        self.see(false);
+        self.mode = Mode::Preview(Box::new(View {
+            content: self.previews.get(&p.url).cloned().map(Ok),
+            loading: true,
+            pr: p,
+            scroll: 0,
+            max_scroll: 0,
+            page: 1,
+        }));
+    }
+
+    fn previewed(&mut self, url: String, result: Result<Preview, String>) {
+        if let Ok(preview) = &result {
+            self.previews.insert(url.clone(), preview.clone());
+        }
+        let Mode::Preview(view) = &mut self.mode else {
+            return;
+        };
+        if view.pr.url != url {
+            return;
+        }
+        view.loading = false;
+        match result {
+            // Keep showing the last preview that loaded, and say why it is old
+            Err(error) if matches!(view.content, Some(Ok(_))) => {
+                self.notify(
+                    "Could not load the preview".into(),
+                    error,
+                    true,
+                    ERROR_TIMEOUT,
+                );
+            }
+            result => view.content = Some(result),
+        }
+    }
+
+    fn on_preview_key(&mut self, mut view: Box<View>, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('p' | 'q') => return,
+            KeyCode::Down | KeyCode::Char('j') => view.scroll_by(1),
+            KeyCode::Up | KeyCode::Char('k') => view.scroll_by(-1),
+            KeyCode::PageDown | KeyCode::Char(' ') => view.scroll_by(view.page as isize),
+            KeyCode::PageUp => view.scroll_by(-(view.page as isize)),
+            KeyCode::Home => view.scroll = 0,
+            KeyCode::End => view.scroll = view.max_scroll,
+            // These act on the PR in the preview, which can be gone from the table, as with u
+            KeyCode::Enter | KeyCode::Char('o') => {
+                self.open_url(view.pr.url.clone());
+                self.see_pr(&view.pr, false);
+            }
+            KeyCode::Char('c') => self.open_url(view.pr.checks_url.clone()),
+            KeyCode::Char('y') => self.copy(view.pr.url.clone()),
+            // The next or previous PR in the table
+            KeyCode::Right | KeyCode::Left => {
+                let here = self.rows.iter().position(|p| p.url == view.pr.url);
+                let next = match (here, key.code == KeyCode::Right) {
+                    (Some(row), true) => Some(row + 1),
+                    (Some(row), false) => row.checked_sub(1),
+                    // It left the table, so the next PR is on the row it was on
+                    (None, true) => self.table.selected(),
+                    (None, false) => self.table.selected().and_then(|r| r.checked_sub(1)),
+                };
+                if let Some(next) = next.filter(|n| *n < self.rows.len()) {
+                    self.table.select(Some(next));
+                    self.preview();
+                    return;
+                }
+            }
+            _ => {}
+        }
+        self.mode = Mode::Preview(view);
     }
 
     /// The table follows each key, and enter keeps the words or esc clears them.
@@ -641,7 +861,7 @@ impl App {
                 }
                 // Like Enter, a click on the row under the cursor opens it
                 if self.table.selected() == Some(index) {
-                    self.open(|p| &p.url);
+                    self.open_pr();
                 } else {
                     self.table.select(Some(index));
                 }
@@ -676,11 +896,20 @@ impl App {
         self.show();
     }
 
+    /// Opens the PR under the cursor in the browser, which counts as seeing it.
+    fn open_pr(&mut self) {
+        self.open(|p| &p.url);
+        self.see(false);
+    }
+
     /// Opens a page of the PR under the cursor in the browser.
     fn open(&mut self, page: fn(&Pr) -> &String) {
-        let Some(url) = self.selected().map(|p| page(p).clone()) else {
-            return;
-        };
+        if let Some(url) = self.selected().map(|p| page(p).clone()) {
+            self.open_url(url);
+        }
+    }
+
+    fn open_url(&mut self, url: String) {
         let opener = if cfg!(target_os = "macos") {
             "open"
         } else {
@@ -707,9 +936,12 @@ impl App {
     }
 
     fn copy_url(&mut self) {
-        let Some(url) = self.selected().map(|p| p.url.clone()) else {
-            return;
-        };
+        if let Some(url) = self.selected().map(|p| p.url.clone()) {
+            self.copy(url);
+        }
+    }
+
+    fn copy(&mut self, url: String) {
         let pbcopy = Command::new("pbcopy")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -733,10 +965,12 @@ impl App {
     }
 
     fn subtitle(&self) -> String {
-        let mut parts = vec![
-            format!("{} PRs", self.rows.len()),
-            format!("by {}", self.group.name()),
-        ];
+        let new = self.rows.iter().filter(|p| p.new).count();
+        let count = match new {
+            0 => format!("{} PRs", self.rows.len()),
+            new => format!("{} PRs, {new} new", self.rows.len()),
+        };
+        let mut parts = vec![count, format!("by {}", self.group.name())];
         parts.extend(self.filter.describe());
         let mut loading: Vec<_> = self
             .feeds
@@ -774,7 +1008,7 @@ impl App {
         self.table_area = body;
         let table = self.table_widget(Utc::now(), body.width);
         frame.render_stateful_widget(table, body, &mut self.table);
-        let footer_line = match self.mode {
+        let footer_line = match &self.mode {
             Mode::Search => {
                 let mut spans = vec![
                     Span::styled(" / ", Style::new().bold().reversed()),
@@ -784,6 +1018,14 @@ impl App {
                 spans.extend(manage::keys(&[("enter", "Keep"), ("esc", "Clear")]).spans);
                 Line::from(spans)
             }
+            Mode::Preview(_) => manage::keys(&[
+                ("↑↓", "Scroll"),
+                ("←→", "Other PRs"),
+                ("o", "Open"),
+                ("c", "Checks"),
+                ("y", "Copy URL"),
+                ("esc", "Close"),
+            ]),
             _ => footer_keys(footer.width),
         };
         frame.render_widget(footer_line, footer);
@@ -796,8 +1038,49 @@ impl App {
             Mode::Form(form) => form.draw(frame, body),
             Mode::Help => draw_help(frame, body),
             Mode::Search => {}
+            Mode::Preview(_) => self.draw_preview(frame, body),
         }
         self.draw_toasts(frame, body);
+    }
+
+    fn draw_preview(&mut self, frame: &mut Frame, area: Rect) {
+        let Mode::Preview(view) = &mut self.mode else {
+            return;
+        };
+        // All of it, as a description needs the room
+        let rect = area;
+        // Inside the borders and the padding
+        let width = rect.width.saturating_sub(4).max(1);
+        let height = usize::from(rect.height.saturating_sub(2));
+        let lines = preview::lines(&view.pr, view.content.as_ref(), width, Utc::now());
+        view.max_scroll = lines.len().saturating_sub(height);
+        view.page = height.max(1);
+        view.scroll = view.scroll.min(view.max_scroll);
+        let mut title = vec![Span::styled(
+            format!(" {} #{} ", view.pr.repo, view.pr.number),
+            Style::new().bold(),
+        )];
+        if view.loading && view.content.is_some() {
+            title.push(Span::styled("loading… ", Style::new().dim()));
+        }
+        // ↓ says there is more below
+        let more = if view.scroll < view.max_scroll {
+            Line::raw(" ↓ more ").right_aligned()
+        } else {
+            Line::default()
+        };
+        frame.render_widget(Clear, rect);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .scroll((view.scroll.min(usize::from(u16::MAX)) as u16, 0))
+                .block(
+                    Block::bordered()
+                        .title(Line::from(title))
+                        .title_bottom(more)
+                        .padding(Padding::horizontal(1)),
+                ),
+            rect,
+        );
     }
 
     fn source_rows(&self) -> Vec<ListRow> {
@@ -974,6 +1257,8 @@ impl App {
                         n => Line::raw(n.to_string()).right_aligned(),
                     },
                     Col::Updated => Line::raw(age(p.updated, now)),
+                    // Like an unread email
+                    Col::Title if p.new => Line::raw(p.title.clone()).bold(),
                     Col::Title => Line::raw(p.title.clone()),
                 })
                 .collect();
@@ -1026,6 +1311,12 @@ impl App {
                 rect,
             );
         }
+    }
+}
+
+impl View {
+    fn scroll_by(&mut self, by: isize) {
+        self.scroll = self.scroll.saturating_add_signed(by).min(self.max_scroll);
     }
 }
 
@@ -1092,7 +1383,7 @@ fn tilde(path: &str) -> String {
 }
 
 /// Word-wraps `text` to `width` columns, and splits words that are too long.
-fn wrap(text: &str, width: u16) -> Vec<String> {
+pub(crate) fn wrap(text: &str, width: u16) -> Vec<String> {
     let width = usize::from(width);
     let mut lines = Vec::new();
     for paragraph in text.lines() {
@@ -1137,7 +1428,7 @@ fn wrap(text: &str, width: u16) -> Vec<String> {
 }
 
 /// Removes terminal escape codes and other control characters, which would break the layout.
-fn clean(text: &str) -> String {
+pub(crate) fn clean(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1198,7 +1489,7 @@ mod tests {
             group,
             interval: Duration::from_secs(60),
         };
-        let mut app = App::new(options, sources, Origin::Flags, tx);
+        let mut app = App::new(options, sources, Origin::Flags, Seen::memory(), tx);
         app.load = |_| Ok(Vec::new());
         app.logins = || vec!["home".into()];
         (app, rx)
@@ -1253,6 +1544,104 @@ mod tests {
         app.show();
         assert_eq!(selected_number(&app), Some(1));
         assert_eq!(app.table.selected(), Some(2));
+    }
+
+    #[test]
+    fn a_pr_is_new_after_the_first_load_until_you_see_it() {
+        let (mut app, _rx) = app(Group::Repo, vec![github(), forgejo()]);
+        let first = pr("GitHub", "a", 1, "x", Status::Needs);
+        app.loaded(0, Ok(vec![first.clone()]));
+        app.loaded(1, Ok(vec![pr("Forgejo", "b", 9, "x", Status::Needs)]));
+        assert!(app.rows.iter().all(|p| !p.new), "the first loads are seen");
+
+        // A PR that opened since, and one that changed since
+        let mut changed = first.clone();
+        changed.updated += chrono::TimeDelta::minutes(5);
+        let opened = pr("GitHub", "a", 2, "x", Status::Needs);
+        app.loaded(0, Ok(vec![changed, opened]));
+        let new: Vec<u64> = app
+            .rows
+            .iter()
+            .filter(|p| p.new)
+            .map(|p| p.number)
+            .collect();
+        assert_eq!(new, [1, 2]);
+        assert!(app.subtitle().starts_with("3 PRs, 2 new · "));
+        assert_eq!(app.rows[0].notes()[0], Note::New);
+
+        // u shows only those, and seeing one takes it out
+        app.on_key(key(KeyCode::Char('u')));
+        assert_eq!(app.rows.len(), 2);
+        app.see(false);
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(selected_number(&app), Some(2));
+
+        // space marks it as seen, and as new again
+        app.on_key(key(KeyCode::Char('u')));
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(!app.rows.iter().any(|p| p.number == 2 && p.new));
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(app.rows.iter().any(|p| p.number == 2 && p.new));
+    }
+
+    #[test]
+    fn a_new_source_starts_with_its_prs_seen() {
+        let (mut app, _rx) = app(Group::Repo, vec![github()]);
+        app.loaded(0, Ok(vec![pr("GitHub", "a", 1, "x", Status::Needs)]));
+        app.change(Change::Add(forgejo())).unwrap();
+        app.loaded(1, Ok(vec![pr("Forgejo", "b", 9, "x", Status::Needs)]));
+        assert!(app.rows.iter().all(|p| !p.new));
+        app.loaded(1, Ok(vec![pr("Forgejo", "b", 10, "x", Status::Needs)]));
+        assert!(app.rows.iter().any(|p| p.number == 10 && p.new));
+    }
+
+    #[test]
+    fn p_previews_the_pr_and_the_arrows_move_to_the_next() {
+        let (mut app, rx) = app(Group::Repo, vec![github()]);
+        app.load_preview = |_, p| {
+            Ok(Preview {
+                body: format!("About #{}", p.number),
+                ..Preview::default()
+            })
+        };
+        app.loaded(
+            0,
+            Ok(vec![
+                pr("GitHub", "a", 1, "x", Status::Needs),
+                pr("GitHub", "a", 2, "x", Status::Needs),
+            ]),
+        );
+        let answer = |app: &mut App| match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Msg::Previewed(url, result) => app.previewed(url, result),
+            _ => panic!("expected a preview"),
+        };
+        let text = |app: &mut App| screen(app, 80, 20).join("\n");
+
+        app.on_key(key(KeyCode::Char('p')));
+        assert!(text(&mut app).contains("Loading…"));
+        answer(&mut app);
+        let shown = text(&mut app);
+        assert!(shown.contains(" acme/a #1 "), "{shown}");
+        assert!(shown.contains("About #1"), "{shown}");
+        assert!(shown.contains(" esc  Close"), "{shown}");
+
+        app.on_key(key(KeyCode::Right));
+        answer(&mut app);
+        assert!(text(&mut app).contains("About #2"));
+        assert_eq!(selected_number(&app), Some(2));
+
+        // esc closes it, and p shows the last preview at once while it loads again
+        app.on_key(key(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Table));
+        app.move_cursor(-1);
+        app.on_key(key(KeyCode::Char('p')));
+        let shown = text(&mut app);
+        assert!(
+            shown.contains("About #1") && shown.contains("loading…"),
+            "{shown}"
+        );
+        answer(&mut app);
+        assert!(!text(&mut app).contains("loading…"));
     }
 
     #[test]
@@ -1450,7 +1839,7 @@ mod tests {
         assert!(lines[3].contains(&format!("me{}2965w", " ".repeat(16))));
         assert!(lines.iter().any(|l| l.contains(" GitHub failed ")));
         assert!(lines[11].starts_with(" o  Open"));
-        assert!(lines[11].contains(" s  Sources"));
+        assert!(lines[11].contains(" p  Preview"));
         assert!(lines[11].trim_end().ends_with(" ?  Help   q  Quit"));
     }
 
@@ -1463,9 +1852,9 @@ mod tests {
                 .map(|s| s.content.as_ref())
                 .collect()
         };
-        // / Filter needs 12 columns, and 10 are left
-        assert_eq!(text(40), " o  Open   ?  Help   q  Quit  ");
-        assert_eq!(text(42), " o  Open   /  Filter   ?  Help   q  Quit  ");
+        // p Preview needs 13 columns, and 10 are left
+        assert_eq!(text(42), " o  Open   ?  Help   q  Quit  ");
+        assert_eq!(text(43), " o  Open   p  Preview   ?  Help   q  Quit  ");
         assert!(text(500).contains(" r  Reload  "));
         assert_eq!(text(5), " ?  Help   q  Quit  ");
     }
@@ -1485,8 +1874,8 @@ mod tests {
         let (mut app, _rx) = app(Group::Repo, vec![github()]);
         app.on_key(key(KeyCode::Char('?')));
         let text = screen(&mut app, 80, 40).join("\n");
-        assert!(text.contains("│ Notes: for you,"), "{text}");
-        assert!(text.contains("shows under the PR it is on."), "{text}");
+        assert!(text.contains("│ Notes: new, the PR changed"), "{text}");
+        assert!(text.contains("│ under the PR it is on."), "{text}");
     }
 
     #[test]

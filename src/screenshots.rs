@@ -14,6 +14,7 @@ use ratatui::style::{Color, Modifier};
 use super::*;
 use crate::pr::Ci;
 use crate::pr::tests::{on, pr};
+use crate::preview::{Check, Comment, FileChange, Files};
 
 /// Sources and PRs for a made-up org, acme.
 fn demo() -> App {
@@ -31,8 +32,9 @@ fn demo() -> App {
         group: Group::Repo,
         interval: Duration::from_secs(60),
     };
-    let mut app = App::new(options, sources, Origin::File(config), tx);
+    let mut app = App::new(options, sources, Origin::File(config), Seen::memory(), tx);
     app.load = |_| Ok(Vec::new());
+    app.load_preview = |_, _| Ok(preview(Utc::now()));
     app.logins = || vec!["work".into()];
 
     let now = Utc::now();
@@ -165,6 +167,12 @@ fn demo() -> App {
 
     app.feeds[0].prs = github;
     app.feeds[1].prs = forgejo;
+    // As after the first loads, and you last saw three of them before they changed
+    let all: Vec<Pr> = app.feeds.iter().flat_map(|f| f.prs.clone()).collect();
+    app.seen.start(&all);
+    for p in all.iter().filter(|p| [418, 88, 1302].contains(&p.number)) {
+        app.seen.unmark(p);
+    }
     app.feeds[2].state =
         State::Failed("HTTP 401: Bad credentials (https://ghe.acme.dev/api/graphql)".into());
     app.updated = Local.with_ymd_and_hms(2026, 11, 4, 9, 41, 27).single();
@@ -178,19 +186,90 @@ fn demo() -> App {
 #[ignore = "writes the README's screenshots to docs/"]
 fn screenshots() {
     let mut app = demo();
-    save("table", &mut app, 136, 15);
+    save("table", &mut app, 140, 15);
 
     app.on_key(key('s'));
     if let Mode::Sources(list) = &mut app.mode {
         list.cursor = 2;
     }
-    save("sources", &mut app, 136, 15);
+    save("sources", &mut app, 140, 15);
     app.mode = Mode::Table;
 
     for _ in 0..3 {
         app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
     }
     save("narrow", &mut app, 92, 15);
+    app.scroll = 0;
+
+    // api #418, with what the host says about it, as if it loaded
+    app.on_key(key('p'));
+    if let Mode::Preview(view) = &mut app.mode {
+        view.content = Some(Ok(preview(Utc::now())));
+        view.loading = false;
+    }
+    save("preview", &mut app, 100, 30);
+}
+
+/// What the host says about api #418.
+fn preview(now: DateTime<Utc>) -> Preview {
+    let comment = |author: &str, minutes, body: &str, verdict| Comment {
+        author: author.into(),
+        when: now - Ago::minutes(minutes),
+        body: body.into(),
+        verdict,
+    };
+    let file = |path: &str, additions, deletions| FileChange {
+        path: path.into(),
+        additions,
+        deletions,
+    };
+    let check = |name: &str, state| Check {
+        name: name.into(),
+        state,
+    };
+    Preview {
+        body: "<!-- What does this change, and why? -->\n\
+               A client that hits the rate limit now gets a Retry-After header with its 429, \
+               so it knows when to try again.\n\n\
+               - The value is the time until the bucket has a token again, in whole seconds\n\
+               - The docs come in #421"
+            .into(),
+        files: Some(Files {
+            additions: 48,
+            deletions: 6,
+            count: 3,
+            changed: vec![
+                file("src/limits/bucket.rs", 31, 4),
+                file("src/limits/middleware.rs", 12, 2),
+                file("tests/limits.rs", 5, 0),
+            ],
+        }),
+        checks: vec![
+            check("lint", Ci::Passed),
+            check("unit", Ci::Passed),
+            check("e2e (chrome)", Ci::Pending),
+        ],
+        comments: vec![
+            comment(
+                "chidi",
+                40,
+                "Seconds or an HTTP date? Seconds is easier for clients.",
+                Some("reviewed"),
+            ),
+            comment(
+                "amy",
+                30,
+                "Seconds. RFC 9110 allows both, and the clients we know read seconds.",
+                None,
+            ),
+            comment(
+                "bao",
+                12,
+                "Can we test the rounding? 0.2 seconds should give 1.",
+                None,
+            ),
+        ],
+    }
 }
 
 fn key(c: char) -> KeyEvent {

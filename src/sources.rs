@@ -12,11 +12,20 @@ use serde_json::Value;
 
 use crate::config::{Kind, Source};
 use crate::pr::{Ci, Pr, Status};
+use crate::preview::{self, Check, Comment, FileChange, Files, Preview};
 
 pub fn fetch(source: &Source) -> Result<Vec<Pr>> {
     match &source.kind {
         Kind::GitHub { query, hostname } => github(source.name(), query, hostname.as_deref()),
         Kind::Forgejo { login, owner } => forgejo(source.name(), login, owner.as_deref()),
+    }
+}
+
+/// The description, checks, files and last comments of `pr`, which `source` found.
+pub fn preview(source: &Source, pr: &Pr) -> Result<Preview> {
+    match &source.kind {
+        Kind::GitHub { hostname, .. } => github_preview(&pr.url, hostname.as_deref()),
+        Kind::Forgejo { login, .. } => forgejo_preview(login, &pr.repo, pr.number),
     }
 }
 
@@ -276,6 +285,7 @@ fn parse_github(name: &str, out: &str) -> Result<Vec<Pr>> {
                 url: n.url,
                 updated: n.updated_at,
                 requested: false,
+                new: false,
                 draft: n.is_draft,
                 conflict: n.mergeable == "CONFLICTING",
                 // As GitHub counts them in its list of PRs
@@ -293,6 +303,199 @@ fn parse_github(name: &str, out: &str) -> Result<Vec<Pr>> {
         }
     }
     Ok(prs)
+}
+
+const GITHUB_PREVIEW_QUERY: &str = "
+query($url: URI!) {
+  resource(url: $url) { ... on PullRequest {
+    body additions deletions changedFiles
+    files(first: 100) { nodes { path additions deletions } }
+    comments(last: 10) { nodes { author { login } body createdAt } }
+    reviews(last: 10) { nodes { author { login } state body submittedAt } }
+    commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {
+      __typename
+      ... on CheckRun { name status conclusion }
+      ... on StatusContext { context state }
+    } } } } } }
+  } }
+}";
+
+#[derive(Deserialize)]
+struct GhPreviewPage {
+    data: GhPreviewData,
+}
+
+#[derive(Deserialize)]
+struct GhPreviewData {
+    /// null when there is no such PR, or no access to it
+    resource: Option<GhPreview>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhPreview {
+    body: String,
+    additions: u64,
+    deletions: u64,
+    changed_files: u64,
+    files: Option<GhNodes<GhFile>>,
+    comments: GhNodes<GhComment>,
+    reviews: GhNodes<GhReview>,
+    commits: GhNodes<GhContextCommitNode>,
+}
+
+#[derive(Deserialize)]
+struct GhNodes<T> {
+    nodes: Vec<T>,
+}
+
+#[derive(Deserialize)]
+struct GhFile {
+    path: String,
+    additions: u64,
+    deletions: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhComment {
+    author: Option<GhLogin>,
+    body: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhReview {
+    author: Option<GhLogin>,
+    state: String,
+    body: String,
+    /// null while it is pending
+    submitted_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Deserialize)]
+struct GhContextCommitNode {
+    commit: GhContextCommit,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhContextCommit {
+    status_check_rollup: Option<GhRollup>,
+}
+
+#[derive(Deserialize)]
+struct GhRollup {
+    contexts: GhNodes<GhContext>,
+}
+
+/// A check run from Actions or an app, or a commit status
+#[derive(Deserialize)]
+#[serde(tag = "__typename")]
+enum GhContext {
+    CheckRun {
+        name: String,
+        status: String,
+        conclusion: Option<String>,
+    },
+    StatusContext {
+        context: String,
+        state: String,
+    },
+}
+
+fn github_preview(url: &str, hostname: Option<&str>) -> Result<Preview> {
+    let query = format!("query={GITHUB_PREVIEW_QUERY}");
+    let url_field = format!("url={url}");
+    let mut cmd = vec!["gh", "api"];
+    if let Some(hostname) = hostname {
+        cmd.extend(["--hostname", hostname]);
+    }
+    cmd.extend(["graphql", "-f", &query, "-f", &url_field]);
+    parse_github_preview(&run(&cmd)?)
+}
+
+fn parse_github_preview(out: &str) -> Result<Preview> {
+    let page: GhPreviewPage =
+        serde_json::from_str(out).context("could not read the reply from gh")?;
+    let pr = page.data.resource.context("gh found no such PR")?;
+    let login = |a: Option<GhLogin>| a.map_or_else(|| "ghost".into(), |a| a.login);
+    let mut comments: Vec<Comment> = pr
+        .comments
+        .nodes
+        .into_iter()
+        .map(|c| Comment {
+            author: login(c.author),
+            when: c.created_at,
+            body: c.body,
+            verdict: None,
+        })
+        .collect();
+    for r in pr.reviews.nodes {
+        let verdict = match r.state.as_str() {
+            "APPROVED" => "approved",
+            "CHANGES_REQUESTED" => "changes requested",
+            // A review with only inline comments has no text of its own
+            "COMMENTED" | "DISMISSED" if !r.body.trim().is_empty() => "reviewed",
+            _ => continue,
+        };
+        let Some(when) = r.submitted_at else { continue };
+        comments.push(Comment {
+            author: login(r.author),
+            when,
+            body: r.body,
+            verdict: Some(verdict),
+        });
+    }
+    let contexts = pr
+        .commits
+        .nodes
+        .into_iter()
+        .next()
+        .and_then(|c| c.commit.status_check_rollup)
+        .map_or_else(Vec::new, |r| r.contexts.nodes);
+    let checks = contexts
+        .into_iter()
+        .map(|c| match c {
+            GhContext::CheckRun {
+                name,
+                status,
+                conclusion,
+            } => Check {
+                name,
+                state: match (status.as_str(), conclusion.as_deref()) {
+                    ("COMPLETED", Some("SUCCESS" | "NEUTRAL" | "SKIPPED")) => Ci::Passed,
+                    ("COMPLETED", _) => Ci::Failing,
+                    _ => Ci::Pending,
+                },
+            },
+            GhContext::StatusContext { context, state } => Check {
+                name: context,
+                state: github_ci(&state).unwrap_or(Ci::Pending),
+            },
+        })
+        .collect();
+    Ok(Preview {
+        body: pr.body,
+        files: Some(Files {
+            additions: pr.additions,
+            deletions: pr.deletions,
+            count: pr.changed_files,
+            changed: pr
+                .files
+                .map_or_else(Vec::new, |f| f.nodes)
+                .into_iter()
+                .map(|f| FileChange {
+                    path: f.path,
+                    additions: f.additions,
+                    deletions: f.deletions,
+                })
+                .collect(),
+        }),
+        checks,
+        comments: preview::last_comments(comments),
+    })
 }
 
 fn github_ci(state: &str) -> Option<Ci> {
@@ -364,6 +567,71 @@ struct TeaReview {
     id: i64,
     reviewer: String,
     state: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    created: Option<DateTime<Utc>>,
+}
+
+/// A PR on its own, with --comments.
+#[derive(Deserialize, Default)]
+struct TeaPullDetail {
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    reviews: Option<Vec<TeaReview>>,
+    #[serde(default)]
+    comments: Option<Vec<TeaComment>>,
+}
+
+#[derive(Deserialize)]
+struct TeaComment {
+    author: String,
+    created: DateTime<Utc>,
+    #[serde(default)]
+    body: String,
+}
+
+fn forgejo_preview(login: &str, repo: &str, number: u64) -> Result<Preview> {
+    let number = number.to_string();
+    let pull: TeaPullDetail = tea(login, &["pulls", &number, "--repo", repo, "--comments"])?;
+    Ok(forgejo_preview_from(pull))
+}
+
+fn forgejo_preview_from(pull: TeaPullDetail) -> Preview {
+    let mut comments: Vec<Comment> = pull
+        .comments
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| Comment {
+            author: c.author,
+            when: c.created,
+            body: c.body,
+            verdict: None,
+        })
+        .collect();
+    for r in pull.reviews.unwrap_or_default() {
+        let verdict = match r.state.as_str() {
+            "APPROVED" => "approved",
+            "REQUEST_CHANGES" => "changes requested",
+            "COMMENT" if !r.body.trim().is_empty() => "reviewed",
+            // REQUEST_REVIEW names who was asked, not who asked
+            _ => continue,
+        };
+        let Some(when) = r.created else { continue };
+        comments.push(Comment {
+            author: r.reviewer,
+            when,
+            body: r.body,
+            verdict: Some(verdict),
+        });
+    }
+    Preview {
+        body: pull.body,
+        files: None,
+        checks: Vec::new(),
+        comments: preview::last_comments(comments),
+    }
 }
 
 fn forgejo(name: &str, login: &str, owner: Option<&str>) -> Result<Vec<Pr>> {
@@ -427,6 +695,7 @@ fn forgejo(name: &str, login: &str, owner: Option<&str>) -> Result<Vec<Pr>> {
             updated: pr.updated,
             mine: pr.author_id == me,
             requested: forgejo_requested(&reviews, &me),
+            new: false,
             draft,
             conflict: pull.mergeable == Some(false) && !draft,
             comments: 0,
@@ -602,7 +871,93 @@ mod tests {
             id,
             reviewer: reviewer.into(),
             state: state.into(),
+            body: String::new(),
+            created: None,
         }
+    }
+
+    #[test]
+    fn github_preview_reads_the_checks_files_and_comments() {
+        let out = r#"{"data":{"resource":{
+          "body":"Adds limits","additions":12,"deletions":3,"changedFiles":2,
+          "files":{"nodes":[{"path":"src/a.rs","additions":10,"deletions":3},
+                            {"path":"b.md","additions":2,"deletions":0}]},
+          "comments":{"nodes":[
+            {"author":{"login":"bao"},"body":"Why 429?","createdAt":"2026-11-04T09:00:00Z"},
+            {"author":null,"body":"old","createdAt":"2026-11-04T08:00:00Z"}]},
+          "reviews":{"nodes":[
+            {"author":{"login":"amy"},"state":"APPROVED","body":"","submittedAt":"2026-11-04T09:30:00Z"},
+            {"author":{"login":"chidi"},"state":"COMMENTED","body":"","submittedAt":"2026-11-04T09:10:00Z"},
+            {"author":{"login":"me"},"state":"PENDING","body":"draft","submittedAt":null}]},
+          "commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[
+            {"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"FAILURE"},
+            {"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"SUCCESS"},
+            {"__typename":"CheckRun","name":"e2e","status":"IN_PROGRESS","conclusion":null},
+            {"__typename":"StatusContext","context":"ci/legacy","state":"ERROR"}]}}}}]}
+        }}}"#;
+        let p = parse_github_preview(out).unwrap();
+        assert_eq!(p.body, "Adds limits");
+        let checks: Vec<(&str, Ci)> = p
+            .checks
+            .iter()
+            .map(|c| (c.name.as_str(), c.state))
+            .collect();
+        assert_eq!(
+            checks,
+            [
+                ("test", Ci::Failing),
+                ("lint", Ci::Passed),
+                ("e2e", Ci::Pending),
+                ("ci/legacy", Ci::Failing)
+            ]
+        );
+        let files = p.files.unwrap();
+        assert_eq!((files.additions, files.deletions, files.count), (12, 3, 2));
+        assert_eq!(files.changed[1].path, "b.md");
+        // Oldest first; a review with only inline comments, or a pending one, has nothing to show
+        let comments: Vec<(&str, Option<&str>)> = p
+            .comments
+            .iter()
+            .map(|c| (c.author.as_str(), c.verdict))
+            .collect();
+        assert_eq!(
+            comments,
+            [("ghost", None), ("bao", None), ("amy", Some("approved"))]
+        );
+    }
+
+    #[test]
+    fn github_preview_without_the_pr_says_so() {
+        let error = parse_github_preview(r#"{"data":{"resource":null}}"#).unwrap_err();
+        assert!(format!("{error:#}").contains("no such PR"));
+    }
+
+    #[test]
+    fn forgejo_preview_merges_comments_and_reviews() {
+        let pull: TeaPullDetail = serde_json::from_str(
+            r#"{"body":"Fix links","reviews":[
+              {"id":1,"reviewer":"erin","state":"REQUEST_REVIEW","body":"","created":"2026-11-04T08:00:00Z"},
+              {"id":2,"reviewer":"dana","state":"APPROVED","body":"","created":"2026-11-04T10:00:00Z"},
+              {"id":3,"reviewer":"bao","state":"COMMENT","body":"Nit","created":"2026-11-04T09:30:00Z"}],
+              "comments":[{"id":5,"author":"erin","created":"2026-11-04T09:00:00Z","body":"Thanks"}]}"#,
+        )
+        .unwrap();
+        let p = forgejo_preview_from(pull);
+        assert_eq!(p.body, "Fix links");
+        assert!(p.files.is_none() && p.checks.is_empty());
+        let comments: Vec<(&str, Option<&str>)> = p
+            .comments
+            .iter()
+            .map(|c| (c.author.as_str(), c.verdict))
+            .collect();
+        assert_eq!(
+            comments,
+            [
+                ("erin", None),
+                ("bao", Some("reviewed")),
+                ("dana", Some("approved"))
+            ]
+        );
     }
 
     #[test]

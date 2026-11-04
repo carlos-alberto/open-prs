@@ -3,7 +3,7 @@
 //! The sources come from --github and --forgejo, else from the config file, else it searches
 //! github.com for the PRs that involve you. s in the TUI adds, edits and deletes them.
 //!
-//! The flags set how the TUI starts, and m, a, n, w, f, d and g toggle them while it runs.
+//! The flags set how the TUI starts, and m, a, n, w, u, f, d and g toggle them while it runs.
 //! It reloads every SECONDS (default 60) and keeps the cursor on the same PR. Keys:
 //! enter/o open the PR in the browser, y copy its URL, r reload now, q quit.
 //!
@@ -14,6 +14,8 @@ mod app;
 mod config;
 mod manage;
 mod pr;
+mod preview;
+mod seen;
 mod sources;
 
 use std::io::{self, IsTerminal, Write};
@@ -25,6 +27,7 @@ use clap::Parser;
 
 use crate::config::Source;
 use crate::pr::{Ci, Filter, Group, Note, Status, pick};
+use crate::seen::Seen;
 
 #[derive(Parser)]
 #[command(
@@ -33,12 +36,17 @@ use crate::pr::{Ci, Filter, Group, Note, Status, pick};
     after_help = "Sources: --github and --forgejo replace the ones in the config file \
                   ($XDG_CONFIG_HOME/open_prs/config.toml, else ~/.config/open_prs/config.toml). \
                   With neither, it searches github.com for involves:@me.\n\
-                  Keys: enter/o open the PR in the browser, y copy its URL, r reload now, \
-                  m/a/n/w/f/d/g toggle the flags, / changes the words, s add, edit and delete \
-                  sources, ? every key, q quit.\n\
+                  Keys: enter/o open the PR in the browser, p preview it, y copy its URL, \
+                  r reload now, \
+                  m/a/n/w/u/f/d/g toggle the flags, / changes the words, space marks the PR \
+                  as seen, s add, edit and delete sources, ? every key, q quit.\n\
+                  A PR is new when it changed since you last opened or previewed it; \
+                  $XDG_STATE_HOME/open_prs/seen.json, else ~/.local/state/open_prs/seen.json, \
+                  keeps when that was.\n\
                   When stdout isn't a terminal, it prints one tab-separated line per PR: \
                   host, repo, number, status, author, title, url, ci (passed, failing, pending \
-                  or empty), notes (for you, draft, conflict and on #N, with commas between), \
+                  or empty), notes (new, for you, draft, conflict and on #N, with commas \
+                  between), \
                   comments."
 )]
 struct Args {
@@ -54,6 +62,9 @@ struct Args {
     /// Only PRs that ask for your review
     #[arg(short = 'w', long)]
     for_you: bool,
+    /// Only PRs that changed since you last saw them
+    #[arg(short = 'u', long)]
+    new: bool,
     /// Only PRs with failing CI
     #[arg(short, long)]
     failing: bool,
@@ -90,6 +101,7 @@ fn main() -> ExitCode {
             None
         },
         for_you: args.for_you,
+        new: args.new,
         failing: args.failing,
         hide_drafts: args.hide_drafts,
         text: args.text,
@@ -102,15 +114,23 @@ fn main() -> ExitCode {
         }
     };
 
+    let seen = match Seen::load(seen::path()) {
+        Ok(seen) => seen,
+        Err(e) => {
+            eprintln!("open_prs: {e:#}");
+            return ExitCode::from(2);
+        }
+    };
+
     if !io::stdout().is_terminal() {
-        return plain(&sources, &filter, args.group);
+        return plain(&sources, &filter, args.group, &seen);
     }
     let options = app::Options {
         filter,
         group: args.group,
         interval: Duration::from_secs(args.interval),
     };
-    match app::run(options, sources, origin) {
+    match app::run(options, sources, origin, seen) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("open_prs: {e:#}");
@@ -119,7 +139,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn plain(sources: &[Source], filter: &Filter, group: Group) -> ExitCode {
+fn plain(sources: &[Source], filter: &Filter, group: Group, seen: &Seen) -> ExitCode {
     let results: Vec<_> = thread::scope(|s| {
         let handles: Vec<_> = sources
             .iter()
@@ -132,7 +152,10 @@ fn plain(sources: &[Source], filter: &Filter, group: Group) -> ExitCode {
     let mut code = ExitCode::SUCCESS;
     for (source, result) in sources.iter().zip(results) {
         match result {
-            Ok(found) => prs.extend(found),
+            Ok(found) => prs.extend(found.into_iter().map(|mut p| {
+                p.new = seen.is_new(&p);
+                p
+            })),
             Err(e) => {
                 eprintln!("open_prs: {}: {e:#}", source.name());
                 code = ExitCode::FAILURE;

@@ -65,6 +65,8 @@ impl Ci {
 /// Something to know about a PR, in the Notes column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Note {
+    /// It changed since you last saw it
+    New,
     /// It asks for your review
     ForYou,
     Draft,
@@ -77,6 +79,7 @@ pub enum Note {
 impl Note {
     pub fn label(self) -> String {
         match self {
+            Note::New => "new".into(),
             Note::ForYou => "for you".into(),
             Note::Draft => "draft".into(),
             Note::Conflict => "conflict".into(),
@@ -86,6 +89,7 @@ impl Note {
 
     pub fn style(self) -> Style {
         match self {
+            Note::New => Style::new().blue().bold(),
             Note::ForYou => Style::new().magenta().bold(),
             Note::Draft => Style::new().dim(),
             Note::Conflict => Style::new().red(),
@@ -135,6 +139,8 @@ pub struct Pr {
     pub mine: bool,
     /// It asks for your review
     pub requested: bool,
+    /// It changed since you last saw it; the app sets it from `seen::Seen`
+    pub new: bool,
     pub draft: bool,
     pub conflict: bool,
     /// What the host counts as comments; see the README
@@ -165,6 +171,7 @@ impl Pr {
 
     pub fn notes(&self) -> Vec<Note> {
         [
+            (self.new, Note::New),
             (self.requested, Note::ForYou),
             (self.draft, Note::Draft),
             (self.conflict, Note::Conflict),
@@ -190,6 +197,8 @@ pub struct Filter {
     pub status: Option<Status>,
     /// Only PRs that ask for your review
     pub for_you: bool,
+    /// Only PRs that changed since you last saw them
+    pub new: bool,
     /// Only PRs with failing CI
     pub failing: bool,
     pub hide_drafts: bool,
@@ -202,6 +211,7 @@ impl Filter {
         (p.mine || !self.mine)
             && self.status.is_none_or(|s| s == p.status)
             && (p.requested || !self.for_you)
+            && (p.new || !self.new)
             && (p.ci == Some(Ci::Failing) || !self.failing)
             && !(p.draft && self.hide_drafts)
             && self.matches_text(p)
@@ -231,6 +241,9 @@ impl Filter {
         }
         if self.for_you {
             parts.push("for you".into());
+        }
+        if self.new {
+            parts.push("new".into());
         }
         if self.failing {
             parts.push("failing CI".into());
@@ -389,6 +402,7 @@ pub mod tests {
             updated: DateTime::UNIX_EPOCH,
             mine: author == "me",
             requested: false,
+            new: false,
             draft: false,
             conflict: false,
             comments: 0,
@@ -477,9 +491,10 @@ pub mod tests {
     }
 
     #[test]
-    fn pick_filters_review_requests_failing_ci_and_drafts() {
+    fn pick_filters_review_requests_new_prs_failing_ci_and_drafts() {
         let mut prs = [1, 2, 3, 4].map(|n| pr("GitHub", "a", n, "x", Status::Needs));
         prs[0].requested = true;
+        prs[2].new = true;
         prs[1].ci = Some(Ci::Failing);
         prs[2].ci = Some(Ci::Pending);
         prs[3].draft = true;
@@ -497,6 +512,11 @@ pub mod tests {
             ..Filter::default()
         };
         assert_eq!(numbers(&prs, &for_you), [1]);
+        let new = Filter {
+            new: true,
+            ..Filter::default()
+        };
+        assert_eq!(numbers(&prs, &new), [3]);
         assert_eq!(numbers(&prs, &failing), [2, 4]);
         assert_eq!(numbers(&prs, &no_drafts), [1, 2, 3]);
         assert_eq!(
@@ -512,12 +532,13 @@ pub mod tests {
         assert_eq!(
             Filter {
                 mine: true,
+                new: true,
                 failing: true,
                 hide_drafts: true,
                 ..for_you
             }
             .describe(),
-            ["mine", "for you", "failing CI", "no drafts"]
+            ["mine", "for you", "new", "failing CI", "no drafts"]
         );
     }
 
@@ -648,6 +669,8 @@ pub mod tests {
         p.requested = true;
         p.parent = Some(7);
         assert_eq!(p.notes(), [Note::ForYou, Note::Conflict, Note::On(7)]);
+        p.new = true;
+        assert_eq!(p.notes()[0], Note::New);
         assert_eq!(Note::On(7).label(), "on #7");
     }
 
