@@ -33,10 +33,12 @@ The screenshots show made-up PRs.
 cargo install --git https://github.com/carlos-alberto/open-prs
 ```
 
-This puts `open_prs` in `~/.cargo/bin`. It needs:
+This puts `open_prs` in `~/.cargo/bin`. Each source needs one of these:
 
-- [`gh`](https://cli.github.com), logged in, for GitHub sources
-- [`tea`](https://gitea.com/gitea/tea), with a login, for Forgejo and Gitea sources
+- A token of its own, with only the rights that open_prs needs; see [Tokens](#tokens)
+- [`gh`](https://cli.github.com), logged in, for GitHub sources, or
+  [`tea`](https://gitea.com/gitea/tea), with a login, for Forgejo and Gitea sources. These
+  logins have all your rights.
 
 ## Usage
 
@@ -152,9 +154,9 @@ didn't pass, the files it changes, and its last 10 comments and reviews. `↑` `
 
 ![The preview of a PR with a pending check and three comments](docs/preview.svg)
 
-It loads each time it opens, and shows the last preview of that PR while it loads. On
-Forgejo and Gitea, tea doesn't give the files or each check, so the preview shows the CI
-state of them all.
+It loads each time it opens, and shows the last preview of that PR while it loads. For a
+Forgejo or Gitea source that uses tea, tea doesn't give the files or each check, so the
+preview shows the CI state of them all. A source with a token gets the files and each check.
 
 ## Reviewers
 
@@ -176,13 +178,13 @@ header says `writes on`.
 
 The host tells each person it asks, so the panel says what `enter` does before you press
 it. On GitHub, the list has GitHub's suggestions, then the teams with access to the repo,
-then the users who can be assigned in it. tea can't list who can review on Forgejo and
-Gitea, so there the list has the authors of the source's PRs and the PR's reviewers, and no
-teams.
+then the users who can be assigned in it. With a token, Forgejo and Gitea give the people
+who can review, then the repo's teams. tea can't list who can review, so for a source that
+uses tea, the list has the authors of the source's PRs and the PR's reviewers, and no teams.
 
 ## Sources
 
-Each source is a GitHub search or a tea login. They come from, in order:
+Each source is a GitHub search, or the PRs on a Forgejo or Gitea. They come from, in order:
 
 1. `--github QUERY` and `--forgejo LOGIN`, each as many times as you like. Changes made with
    `s` last until you quit.
@@ -197,20 +199,101 @@ writes = true                  # let v change the reviewers on the host; default
 [[source]]
 kind = "github"
 query = "org:rust-lang"        # GitHub search qualifiers; default involves:@me
+auth = "token"                 # a token of its own; "gh", or no auth, uses gh's login
 # hostname = "ghe.example.com" # for GitHub Enterprise
 # name = "Rust"                # the Host column; default GitHub, or the hostname
 
 [[source]]
 kind = "forgejo"               # or "gitea"
-login = "codeberg.org"         # a name from `tea logins list`
+url = "https://codeberg.org"   # with auth = "token"
+auth = "token"
 owner = "forgejo"              # only this user's or org's repos; without it, a public
                                # instance gives the PRs of every public repo
-# name = "Codeberg"            # default: the login
+# name = "Codeberg"            # default: the host
+
+[[source]]
+kind = "forgejo"
+login = "home"                 # a name from `tea logins list`, without auth = "token"
 ```
 
-`s` shows each source, how many PRs it found, and the error of a source that failed:
+`s` shows each source, how many PRs it found, its Auth (`token`, `gh` or `tea`), and the
+error of a source that failed. For a source that uses gh or tea, it says that the source has
+all the rights of that login. `a` adds a source with a token of its own, unless you pick gh
+or tea for Auth.
 
-![The Sources panel, with a GitHub Enterprise source that failed](docs/sources.svg)
+![The Sources panel, with two token sources and a GitHub Enterprise source that failed](docs/sources.svg)
+
+## Tokens
+
+The login of gh or tea can do all that you can do: a gh token usually has the `repo` scope,
+which can write to every repo that you can get to, and tea signs with your SSH key. A bug in
+open_prs, a bad dependency, or a different `gh` earlier in `PATH` would get all those rights.
+A source with `auth = "token"` uses a token of its own in place of that, with only the
+rights that open_prs needs. open_prs then calls the host's API itself.
+
+In the TUI, `s`, then `a` or `e`, then paste the token in the Token field. The field shows
+`••••`, never the token, and `enter` puts the token in the keychain. When you delete a source,
+open_prs asks if it must delete the source's token from the keychain too.
+
+open_prs looks for a source's token in this order:
+
+1. `token_command = "op read op://Work/GitHub/token"` on the source: open_prs runs this
+   program without a shell, and reads the token from what it prints.
+2. The keychain: macOS Keychain, or the Secret Service on Linux. The service is `open_prs`,
+   and the account is `<kind>:<host>:<name>`, such as `github:github.com:GitHub`.
+3. `token_env = "NAME"` on the source: the environment variable `NAME`, for scripts and CI.
+
+If it finds no token, the source fails, and the error says where open_prs looked. Plain
+output finds tokens in the same way.
+
+What open_prs does with a token:
+
+- It sends the token only to the source's own host, over https. It follows no redirect, so
+  a redirect to another host fails and the token stays where it was.
+- It reads each token once per run, and again after the host refuses it.
+- It never writes a token to the config file, to `seen.json` or to the screen.
+- gh, tea and a `token_command` don't get the variables in `token_env`. The programs for the
+  browser, the clipboard and notifications get almost no environment at all.
+- A Forgejo or Gitea on `http`, such as one on your own network, needs `allow_http = true`
+  on the source. The token then goes as plain text.
+
+### A GitHub token
+
+Make a fine-grained token in GitHub's Settings, Developer settings, Personal access tokens,
+Fine-grained tokens:
+
+- Resource owner: the org, or you.
+- Repository access: the repos that open_prs must see.
+- Repository permissions:
+  - Pull requests: Read. Read and write only if `v` must ask for reviews.
+  - Commit statuses: Read, for CI.
+  - Metadata: Read. GitHub adds it.
+  - Administration: Read, only if `v` must list the repo's teams. This also lets the token
+    read the repo's settings. Without it, the reviewer panel has no teams.
+
+Limits of fine-grained tokens:
+
+- A token works for one owner only: one org, or your own repos. Thus each org needs its own
+  source, with a query such as `org:acme`, and its own token. A search across orgs, such as
+  `involves:@me`, needs a classic token. A classic token needs the `repo` scope to read
+  private repos, and that scope can write too.
+- GitHub's docs say that fine-grained tokens can't use the Checks API. CI from check runs,
+  such as GitHub Actions, may not show with such a token.
+- An org can make its owners approve each fine-grained token, or block them.
+- A fine-grained token expires: by default after 30 days.
+- If the org uses SAML SSO, authorize the token for it. When GitHub asks for this, the error
+  gives the link.
+
+For GitHub Enterprise, set `hostname`, and make the token on that host.
+
+### A Forgejo or Gitea token
+
+Make a token in Settings, Applications, Access tokens, with these scopes:
+
+- `read:repository`: the PRs, reviews, files, CI, who can review, and the repo's teams.
+  `write:repository` only if `v` must ask for reviews.
+- `read:issue`: the search for PRs, and their comments.
+- `read:user`: who you are, for `mine` and `for you`.
 
 ## Plain output
 
