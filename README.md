@@ -232,7 +232,9 @@ A source with `auth = "token"` uses a token of its own in place of that, with on
 rights that open_prs needs. open_prs then calls the host's API itself.
 
 In the TUI, `s`, then `a` or `e`. In the form, `ctrl+o` opens the host's page that makes a
-token. Make the token there, copy it, and paste it in the Token field. The field shows
+token. While the Token field has the focus, the form lists the permissions or scopes that
+the token needs, in case the page doesn't keep them. Make the token there, copy it, and
+paste it in the Token field. The field shows
 `••••`, never the token, and `enter` puts the token in the keychain. When you delete a source,
 open_prs asks if it must delete the source's token from the keychain too.
 
