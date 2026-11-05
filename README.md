@@ -230,10 +230,13 @@ GitHub	acme/web	1291	needs review	sam	failing	on #1290
 cargo test
 cargo clippy --all-targets
 cargo test screenshots -- --ignored   # draws docs/*.svg again
+cargo deny check                      # security holes, licenses and sources of the crates
 ```
 
 The screenshots are the real TUI, drawn with the made-up PRs in `src/screenshots.rs`. CI
 runs these on each push and PR, and fails when the screenshots don't match the code.
+`deny.toml` sets what `cargo deny check` allows. Each week, Dependabot makes PRs for new
+versions of the crates and the actions.
 
 ## License
 
