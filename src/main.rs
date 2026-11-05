@@ -13,6 +13,7 @@
 mod app;
 mod config;
 mod desktop;
+mod http;
 mod manage;
 mod notify;
 mod pr;
@@ -20,6 +21,7 @@ mod preview;
 mod reviewers;
 mod seen;
 mod sources;
+mod token;
 
 use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
@@ -38,7 +40,9 @@ use crate::seen::Seen;
     about = "List open PRs on GitHub, Forgejo and Gitea with their review and CI status.",
     after_help = "Sources: --github and --forgejo replace the ones in the config file \
                   ($XDG_CONFIG_HOME/open_prs/config.toml, else ~/.config/open_prs/config.toml). \
-                  With neither, it searches github.com for involves:@me.\n\
+                  With neither, it searches github.com for involves:@me. A source with \
+                  auth = \"token\" uses a token of its own, from its token_command, the \
+                  keychain or its token_env; the others use the login of gh or tea.\n\
                   Keys: enter/o open the PR in the browser, p preview it, v ask for reviews \
                   (with --writes or writes = true in the config file), \
                   y copy its URL, \
@@ -131,6 +135,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // gh and tea must not get the variables that hold the sources' tokens
+    token::note_vars(&config.sources);
 
     let seen = match Seen::load(seen::path()) {
         Ok(seen) => seen,

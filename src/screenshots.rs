@@ -12,6 +12,7 @@ use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
 
 use super::*;
+use crate::config::Token;
 use crate::pr::Ci;
 use crate::pr::tests::{on, pr};
 use crate::preview::{Check, Comment, FileChange, Files};
@@ -19,9 +20,14 @@ use crate::preview::{Check, Comment, FileChange, Files};
 /// Sources and PRs for a made-up org, acme.
 fn demo() -> App {
     let (tx, _rx) = mpsc::channel();
+    // Two with tokens of their own, and one that uses gh's login
     let sources = vec![
-        Source::github("org:acme", None, None),
-        Source::forgejo("work", Some("acme".into()), Some("Forgejo".into())),
+        Source::github("org:acme", None, None).with_token(Token::default()),
+        Source::forgejo_api(
+            "https://git.example.com",
+            Some("acme".into()),
+            Some("Forgejo".into()),
+        ),
         Source::github("org:acme-labs", Some("ghe.acme.dev".into()), None),
     ];
     let config = std::env::home_dir()
@@ -40,6 +46,7 @@ fn demo() -> App {
     app.load_reviewers = |_, _, _| Ok(Reviewers::default());
     app.save_reviewers = |_, _, _| Ok(());
     app.logins = || vec!["work".into()];
+    app.keychain = Arc::new(token::tests::Fake::default());
 
     let now = Utc::now();
     let make = |host: &str, repo: &str, number: u64, author: &str, status: Status, title: &str| {

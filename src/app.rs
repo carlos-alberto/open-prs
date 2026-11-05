@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -27,6 +28,7 @@ use crate::preview::{self, Preview};
 use crate::reviewers::{self, Picker, Reviewers};
 use crate::seen::Seen;
 use crate::sources;
+use crate::token::{self, Keychain};
 
 const TITLE: &str = "Open PRs";
 const COPIED_TIMEOUT: Duration = Duration::from_secs(5);
@@ -316,6 +318,8 @@ pub struct App {
     /// Allow changes on the hosts. Only the config file and --writes turn it on, so a key
     /// pressed by mistake can't
     writes: bool,
+    /// Where the form puts tokens; the tests use one in memory
+    keychain: Arc<dyn Keychain>,
 }
 
 pub struct Options {
@@ -409,6 +413,7 @@ impl App {
             // Without tea, the form shows no hint
             logins: || sources::tea_logins().unwrap_or_default(),
             writes: options.writes,
+            keychain: Arc::new(token::Os),
         }
     }
 
@@ -650,6 +655,9 @@ impl App {
 
     /// Makes a change to the sources, and saves it when they came from the config file.
     fn change(&mut self, change: Change) -> Result<(), String> {
+        if let Change::Add(source) | Change::Update(_, source) = &change {
+            token::note_vars([source]);
+        }
         if let Origin::File(path) = &self.origin {
             let current: Vec<Source> = self.feeds.iter().map(|f| f.source.clone()).collect();
             config::save(path, &current, &change).map_err(|e| format!("{e:#}"))?;
@@ -970,13 +978,29 @@ impl App {
 
     fn on_sources_key(&mut self, mut list: List, key: KeyEvent) {
         list.message = None;
+        if let Some(source) = list.forget.take() {
+            list.message = Some(if key.code == KeyCode::Char('y') {
+                match token::delete(&*self.keychain, &source) {
+                    Ok(_) => format!("Deleted the token of {} from the keychain", source.name()),
+                    Err(e) => format!("{e:#}"),
+                }
+            } else {
+                format!("Kept the token of {} in the keychain", source.name())
+            });
+            self.mode = Mode::Sources(list);
+            return;
+        }
         if list.confirm {
             list.confirm = false;
             if key.code == KeyCode::Char('y') {
+                let source = self.feeds[list.cursor].source.clone();
                 if self.feeds.len() == 1 {
                     list.message = Some("Add another source before you delete the last one".into());
                 } else if let Err(error) = self.change(Change::Remove(list.cursor)) {
                     list.message = Some(error);
+                } else if source.token().is_some() && token::saved(&*self.keychain, &source) {
+                    // Another source can't use it, as each has its own account
+                    list.forget = Some(source);
                 }
                 list.cursor = list.cursor.min(self.feeds.len() - 1);
             }
@@ -993,7 +1017,9 @@ impl App {
             }
             KeyCode::Char('e') | KeyCode::Enter => {
                 let source = &self.feeds[list.cursor].source;
-                self.mode = Mode::Form(Form::edit(list.cursor, source, (self.logins)()));
+                let saved = source.token().is_some() && token::saved(&*self.keychain, source);
+                let form = Form::edit(list.cursor, source, (self.logins)(), saved);
+                self.mode = Mode::Form(form);
                 return;
             }
             KeyCode::Char('d') => list.confirm = true,
@@ -1012,7 +1038,13 @@ impl App {
         match form.on_key(key) {
             FormAction::None => self.mode = Mode::Form(form),
             FormAction::Cancel => self.mode = back(form.editing.unwrap_or(0)),
-            FormAction::Save(source) => {
+            FormAction::Save(source, new_token) => {
+                let old = form.editing.map(|i| self.feeds[i].source.clone());
+                if let Err(error) = self.keep_token(old.as_ref(), &source, new_token.as_deref()) {
+                    form.error = Some(format!("{error:#}"));
+                    self.mode = Mode::Form(form);
+                    return;
+                }
                 let (change, cursor) = match form.editing {
                     Some(i) => (Change::Update(i, source), i),
                     None => (Change::Add(source), self.feeds.len()),
@@ -1025,6 +1057,20 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    /// Puts a new token in the keychain, or moves the old one when the source's account
+    /// changed. It runs before the config file saves, so a source never names a token that
+    /// failed to save.
+    fn keep_token(&self, old: Option<&Source>, new: &Source, token: Option<&str>) -> Result<()> {
+        if new.token().is_none() {
+            return Ok(());
+        }
+        match (token, old) {
+            (Some(token), _) => token::save(&*self.keychain, new, token),
+            (None, Some(old)) if old.token().is_some() => token::rename(&*self.keychain, old, new),
+            _ => Ok(()),
         }
     }
 
@@ -1307,6 +1353,7 @@ impl App {
                         State::Failed(error) => Some(clean(error)),
                         _ => None,
                     },
+                    cli: f.source.cli(),
                 }
             })
             .collect()
@@ -1749,6 +1796,8 @@ mod tests {
         let mut app = App::new(options, sources, Origin::Flags, Seen::memory(), tx);
         app.load = |_| Ok(Vec::new());
         app.logins = || vec!["home".into()];
+        // Never the real keychain
+        app.keychain = Arc::new(token::tests::Fake::default());
         (app, rx)
     }
 
@@ -2127,27 +2176,50 @@ mod tests {
         // Only the first line of the error fits
         assert!(shows("GitHub failed: HTTP 401: Bad credentials "));
 
-        // Add a Forgejo source
+        // gh's login has all its rights, and the panel says so
+        assert!(shows("GitHub uses gh's login, with all its rights"));
+
+        // Add a Forgejo source with a token, which goes in the keychain
+        let keychain = Arc::new(token::tests::Fake::default());
+        app.keychain = keychain.clone();
+        let stored = || keychain.0.lock().unwrap().clone();
         app.on_key(key(KeyCode::Char('a')));
         app.on_key(key(KeyCode::Right));
+        for _ in 0..3 {
+            app.on_key(key(KeyCode::Tab));
+        }
+        type_text(&mut app, "https://git.example.com");
         for _ in 0..2 {
             app.on_key(key(KeyCode::Tab));
         }
-        for c in "home".chars() {
-            app.on_key(key(KeyCode::Char(c)));
-        }
+        type_text(&mut app, "tok");
         app.on_key(key(KeyCode::Enter));
         assert!(matches!(&app.mode, Mode::Sources(list) if list.cursor == 1));
-        assert_eq!(app.feeds[1].source, Source::forgejo("home", None, None));
+        let added = Source::forgejo_api("https://git.example.com", None, None);
+        assert_eq!(app.feeds[1].source, added);
         assert_eq!(app.feeds[1].state, State::Loading);
+        let account = |name: &str| format!("forgejo:git.example.com:{name}");
+        assert_eq!(
+            stored(),
+            HashMap::from([(account("git.example.com"), "tok".to_owned())])
+        );
+        let lines = screen(&mut app, 100, 16);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("git.example.com") && l.contains(" token  loading…")),
+            "{lines:?}"
+        );
 
-        // Rename it
+        // Rename it, and its token moves with it
         app.on_key(key(KeyCode::Char('e')));
-        for c in "Home".chars() {
-            app.on_key(key(KeyCode::Char(c)));
-        }
+        type_text(&mut app, "Home");
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.feeds[1].source.name(), "Home");
+        assert_eq!(
+            stored(),
+            HashMap::from([(account("Home"), "tok".to_owned())])
+        );
 
         // Delete the first one; d asks first, and another key keeps it
         app.on_key(key(KeyCode::Up));
@@ -2164,6 +2236,23 @@ mod tests {
         app.on_key(key(KeyCode::Char('y')));
         assert_eq!(app.feeds.len(), 1);
         assert!(matches!(&app.mode, Mode::Sources(list) if list.message.is_some()));
+
+        // Deleting a source with a token asks about the token too
+        app.change(Change::Add(github())).unwrap();
+        app.on_key(key(KeyCode::Char('d')));
+        app.on_key(key(KeyCode::Char('y')));
+        assert_eq!(app.feeds.len(), 1);
+        let lines = screen(&mut app, 100, 16);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Delete the token of Home from the keychain too?")),
+            "{lines:?}"
+        );
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(stored().is_empty());
+        assert!(matches!(&app.mode, Mode::Sources(list)
+            if list.message.as_deref() == Some("Deleted the token of Home from the keychain")));
 
         app.on_key(key(KeyCode::Esc));
         assert!(matches!(app.mode, Mode::Table));
