@@ -12,6 +12,7 @@
 
 mod app;
 mod config;
+mod desktop;
 mod manage;
 mod notify;
 mod pr;
