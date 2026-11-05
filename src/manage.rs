@@ -68,6 +68,10 @@ pub fn draw_list(frame: &mut Frame, area: Rect, list: &List, rows: &[ListRow], n
             ))
             .dim(),
         );
+        lines.push(
+            Line::from("This is deprecated. To give it a token, press e and pick token for Auth.")
+                .red(),
+        );
     }
     // The first line of the error of the source under the cursor
     if let Some(error) = rows.get(list.cursor).and_then(|r| r.error.as_deref()) {
@@ -549,8 +553,14 @@ impl Form {
                 let mut spans = vec![label];
                 if field.choice() {
                     let options = match field {
-                        Field::Kind => [("github", self.github), ("forgejo", !self.github)],
-                        _ => [("token", self.token_auth), (self.cli(), !self.token_auth)],
+                        Field::Kind => [
+                            ("github".to_owned(), self.github),
+                            ("forgejo".to_owned(), !self.github),
+                        ],
+                        _ => [
+                            ("token".to_owned(), self.token_auth),
+                            (format!("{} (deprecated)", self.cli()), !self.token_auth),
+                        ],
                     };
                     for (option, on) in options {
                         let style = if on {
@@ -584,6 +594,7 @@ impl Form {
         if !self.token_auth {
             let note = format!("Uses {}'s login, with all its rights", self.cli());
             lines.push(Line::from(note).dim());
+            lines.push(Line::from("This is deprecated, and a later version will remove it.").red());
         }
         if !self.github && !self.token_auth && !self.logins.is_empty() {
             lines.push(Line::from(format!("tea logins: {}", self.logins.join(", "))).dim());
@@ -718,7 +729,10 @@ mod tests {
         form.on_key(key(KeyCode::Tab));
         form.on_key(key(KeyCode::Right));
         assert!(!form.fields().contains(&Field::Token));
-        assert!(draw(&form).contains("Uses gh's login, with all its rights"));
+        let text = draw(&form);
+        assert!(text.contains("Uses gh's login, with all its rights"));
+        assert!(text.contains(" gh (deprecated) "), "{text}");
+        assert!(text.contains("This is deprecated, and a later version will remove it."));
         assert_eq!(saved(&mut form), Some(github));
     }
 

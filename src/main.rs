@@ -42,7 +42,8 @@ use crate::seen::Seen;
                   ($XDG_CONFIG_HOME/open_prs/config.toml, else ~/.config/open_prs/config.toml). \
                   With neither, it searches github.com for involves:@me. A source with \
                   auth = \"token\" uses a token of its own, from its token_command, the \
-                  keychain or its token_env; the others use the login of gh or tea.\n\
+                  keychain or its token_env; the others use the login of gh or tea, which is \
+                  deprecated: a later version will remove it.\n\
                   Keys: enter/o open the PR in the browser, p preview it, v ask for reviews \
                   (with --writes or writes = true in the config file), \
                   y copy its URL, \
@@ -103,10 +104,12 @@ struct Args {
     #[arg(short, long, value_name = "SECONDS", default_value_t = 60,
           value_parser = clap::value_parser!(u64).range(1..))]
     interval: u64,
-    /// Search GitHub with these qualifiers, such as "org:rust-lang" (more than once for more searches)
+    /// Search GitHub with these qualifiers, such as "org:rust-lang", through gh's login, which is
+    /// deprecated (more than once for more searches)
     #[arg(long, value_name = "QUERY")]
     github: Vec<String>,
-    /// Show the PRs this tea login can see on Forgejo or Gitea (more than once for more logins)
+    /// Show the PRs this tea login can see on Forgejo or Gitea; deprecated, as are all tea
+    /// logins (more than once for more logins)
     #[arg(long, value_name = "LOGIN")]
     forgejo: Vec<String>,
 }
@@ -148,6 +151,12 @@ fn main() -> ExitCode {
     };
 
     if !io::stdout().is_terminal() {
+        if let Some(message) = config::deprecated(&config.sources) {
+            eprintln!(
+                "open_prs: warning: {message} Give each source auth = \"token\"; see Tokens in \
+                 the README."
+            );
+        }
         return plain(&config.sources, &filter, args.group, &seen);
     }
     let options = app::Options {

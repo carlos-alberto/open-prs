@@ -42,7 +42,8 @@ pub enum Kind {
 /// How a Forgejo source logs in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Login {
-    /// A name from `tea logins list`: tea calls the host, with all the rights of that login
+    /// A name from `tea logins list`: tea calls the host, with all the rights of that login.
+    /// Deprecated, as is gh's login: see `deprecated`.
     Tea(String),
     /// The API of the Forgejo at `url`, with a token of its own
     Token {
@@ -292,7 +293,29 @@ enum Entry {
     },
 }
 
-/// The `auth` key: how a source logs in. Without it, a source uses gh or tea.
+/// What to say about the sources that use the login of gh or tea, which is deprecated; None
+/// when each source has a token of its own.
+pub fn deprecated(sources: &[Source]) -> Option<String> {
+    let users: Vec<&Source> = sources.iter().filter(|s| s.cli().is_some()).collect();
+    let who = match users.as_slice() {
+        [] => return None,
+        [one] => format!("{} uses {}'s login", one.name(), one.cli().unwrap_or("gh")),
+        [many @ .., last] => {
+            let names: Vec<&str> = many.iter().map(|s| s.name()).collect();
+            format!(
+                "{} and {} use the login of gh or tea",
+                names.join(", "),
+                last.name()
+            )
+        }
+    };
+    Some(format!(
+        "{who}. That is deprecated, and a later version will remove it."
+    ))
+}
+
+/// The `auth` key: how a source logs in. Without it, a source uses gh or tea, which is
+/// deprecated.
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum Auth {
@@ -636,6 +659,23 @@ fn set(table: &mut Table, key: &str, new: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sources_that_use_gh_or_tea_are_deprecated() {
+        let token = Source::github("org:acme", None, None).with_token(Token::default());
+        let gh = Source::github("org:acme", None, Some("Acme".into()));
+        let tea = Source::forgejo("home", None, None);
+        let later = "That is deprecated, and a later version will remove it.";
+        assert_eq!(deprecated(std::slice::from_ref(&token)), None);
+        assert_eq!(
+            deprecated(&[token.clone(), tea.clone()]).unwrap(),
+            format!("home uses tea's login. {later}")
+        );
+        assert_eq!(
+            deprecated(&[gh.clone(), token, gh, tea]).unwrap(),
+            format!("Acme, Acme and home use the login of gh or tea. {later}")
+        );
+    }
 
     #[test]
     fn parse_reads_each_kind_with_its_defaults() {

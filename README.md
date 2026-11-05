@@ -36,9 +36,10 @@ cargo install --git https://github.com/carlos-alberto/open-prs
 This puts `open_prs` in `~/.cargo/bin`. Each source needs one of these:
 
 - A token of its own, with only the rights that open_prs needs; see [Tokens](#tokens)
-- [`gh`](https://cli.github.com), logged in, for GitHub sources, or
+- Deprecated: [`gh`](https://cli.github.com), logged in, for GitHub sources, or
   [`tea`](https://gitea.com/gitea/tea), with a login, for Forgejo and Gitea sources. These
-  logins have all your rights.
+  logins have all your rights, and a later version will remove them; see
+  [Deprecated: the logins of gh and tea](#deprecated-the-logins-of-gh-and-tea).
 
 ## Usage
 
@@ -49,9 +50,10 @@ open_prs [-m/--mine] [-a/--approved | -n/--needs-review] [-w/--for-you] [-u/--ne
          [--github QUERY]... [--forgejo LOGIN]...
 ```
 
-With no sources, it shows the PRs on github.com that involve you. The flags set how the TUI
-starts. The keys `m`, `a`, `n`, `w`, `u`, `f`, `d` and `g` toggle them while it runs, and `/`
-changes the words. It reloads every SECONDS (default 60).
+With no sources, it shows the PRs on github.com that involve you, through gh's login.
+`--github` and `--forgejo` also use the logins of gh and tea, so they are deprecated. The
+flags set how the TUI starts. The keys `m`, `a`, `n`, `w`, `u`, `f`, `d` and `g` toggle them
+while it runs, and `/` changes the words. It reloads every SECONDS (default 60).
 
 | Key | Action |
 |-----|--------|
@@ -187,10 +189,10 @@ uses tea, the list has the authors of the source's PRs and the PR's reviewers, a
 Each source is a GitHub search, or the PRs on a Forgejo or Gitea. They come from, in order:
 
 1. `--github QUERY` and `--forgejo LOGIN`, each as many times as you like. Changes made with
-   `s` last until you quit.
+   `s` last until you quit. These sources use the logins of gh and tea, which are deprecated.
 2. `$XDG_CONFIG_HOME/open_prs/config.toml`, else `~/.config/open_prs/config.toml`. Changes
    made with `s` save to this file, and keep its comments.
-3. Neither: one GitHub search for `involves:@me`.
+3. Neither: one GitHub search for `involves:@me`, through gh's login, which is deprecated.
 
 ```toml
 notify = true                  # desktop notifications; b sets it; default false
@@ -199,7 +201,7 @@ writes = true                  # let v change the reviewers on the host; default
 [[source]]
 kind = "github"
 query = "org:rust-lang"        # GitHub search qualifiers; default involves:@me
-auth = "token"                 # a token of its own; "gh", or no auth, uses gh's login
+auth = "token"                 # its own token; "gh" or no auth: gh's login, deprecated
 # hostname = "ghe.example.com" # for GitHub Enterprise
 # name = "Rust"                # the Host column; default GitHub, or the hostname
 
@@ -213,13 +215,13 @@ owner = "forgejo"              # only this user's or org's repos; without it, a 
 
 [[source]]
 kind = "forgejo"
-login = "home"                 # a name from `tea logins list`, without auth = "token"
+login = "home"                 # deprecated: a name from `tea logins list`
 ```
 
 `s` shows each source, how many PRs it found, its Auth (`token`, `gh` or `tea`), and the
 error of a source that failed. For a source that uses gh or tea, it says that the source has
-all the rights of that login. `a` adds a source with a token of its own, unless you pick gh
-or tea for Auth.
+all the rights of that login, and that this is deprecated. `a` adds a source with a token of
+its own, unless you pick gh or tea for Auth.
 
 ![The Sources panel, with two token sources and a GitHub Enterprise source that failed](docs/sources.svg)
 
@@ -259,6 +261,26 @@ What open_prs does with a token:
   browser, the clipboard and notifications get almost no environment at all.
 - A Forgejo or Gitea on `http`, such as one on your own network, needs `allow_http = true`
   on the source. The token then goes as plain text.
+
+### Deprecated: the logins of gh and tea
+
+A source without `auth = "token"` uses the login of gh or tea. This is deprecated, and a
+later version of open_prs will remove it. While a source uses such a login, the TUI shows a
+warning when it starts, and plain output writes a warning to stderr. The Sources panel and
+the form also say so.
+
+To give a source a token in the TUI:
+
+1. Press `s`, move the cursor to the source, and press `e`.
+2. Pick `token` for Auth.
+3. For a Forgejo or Gitea source, give the URL of the host in place of the tea login.
+4. Press `ctrl+o` to make a token, and paste it in the Token field.
+5. Press `enter`.
+
+In the config file, add `auth = "token"` to the source. A Forgejo or Gitea source also needs
+`url` in place of `login`. Sources from `--github` and `--forgejo` can't have a token, so put
+them in the config file. The default search for `involves:@me` uses gh, so add a source of
+your own. A fine-grained token sees one owner only, so give each org its own source.
 
 ### A GitHub token
 
