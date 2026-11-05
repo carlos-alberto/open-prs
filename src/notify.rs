@@ -2,10 +2,11 @@
 
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::thread;
 
 use crate::app::clean;
+use crate::desktop;
 use crate::pr::{Ci, Pr, Status};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,7 +65,7 @@ pub fn changes(old: &[Pr], new: &[Pr]) -> Vec<Notice> {
 pub fn send(notice: &Notice) {
     let child = if cfg!(target_os = "macos") {
         // The text goes in as arguments, so a PR's title can't change the script
-        Command::new("osascript")
+        desktop::command("osascript")
             .args([
                 "-e",
                 "on run argv",
@@ -80,7 +81,7 @@ pub fn send(notice: &Notice) {
             .stderr(Stdio::null())
             .spawn()
     } else {
-        Command::new("notify-send")
+        desktop::command("notify-send")
             .args(["--app-name=open_prs", &notice.title, &notice.body])
             .stdin(Stdio::null())
             .stdout(Stdio::null())

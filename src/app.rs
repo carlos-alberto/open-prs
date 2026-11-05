@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,6 +19,7 @@ use ratatui::widgets::{Block, Cell, Clear, Padding, Paragraph, Row, Table, Table
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::config::{self, Change, Origin, Source};
+use crate::desktop;
 use crate::manage::{self, Form, FormAction, List, ListRow};
 use crate::notify::{self, Notice};
 use crate::pr::{Filter, Group, Note, Pr, Status, age, pick, shared_owner};
@@ -1113,7 +1114,7 @@ impl App {
         } else {
             "xdg-open"
         };
-        let child = Command::new(opener)
+        let child = desktop::command(opener)
             .arg(url)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1140,7 +1141,7 @@ impl App {
     }
 
     fn copy(&mut self, url: String) {
-        let pbcopy = Command::new("pbcopy")
+        let pbcopy = desktop::command("pbcopy")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
