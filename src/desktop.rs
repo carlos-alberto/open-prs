@@ -3,7 +3,8 @@
 //! open_prs gets to them.
 
 use std::env;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
 
 /// The variables that a desktop program can need. The first eight find the program, the
 /// user's files, the language and the display. xdg-open uses the last three to find the
@@ -33,6 +34,24 @@ pub fn command(program: &str) -> Command {
         }
     }
     command
+}
+
+/// Opens `url` in the browser. It doesn't wait for the browser to start.
+pub fn browse(url: &str) -> Result<(), String> {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let mut child = command(opener)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("{opener}: {e}"))?;
+    thread::spawn(move || child.wait());
+    Ok(())
 }
 
 #[cfg(test)]

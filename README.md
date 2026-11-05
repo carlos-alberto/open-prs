@@ -231,7 +231,8 @@ open_prs, a bad dependency, or a different `gh` earlier in `PATH` would get all 
 A source with `auth = "token"` uses a token of its own in place of that, with only the
 rights that open_prs needs. open_prs then calls the host's API itself.
 
-In the TUI, `s`, then `a` or `e`, then paste the token in the Token field. The field shows
+In the TUI, `s`, then `a` or `e`. In the form, `ctrl+o` opens the host's page that makes a
+token. Make the token there, copy it, and paste it in the Token field. The field shows
 `••••`, never the token, and `enter` puts the token in the keychain. When you delete a source,
 open_prs asks if it must delete the source's token from the keychain too.
 
@@ -259,8 +260,11 @@ What open_prs does with a token:
 
 ### A GitHub token
 
-Make a fine-grained token in GitHub's Settings, Developer settings, Personal access tokens,
-Fine-grained tokens:
+`ctrl+o` in the form opens GitHub's page for a new fine-grained token, with its name, the
+owner from the query (`org:`, `user:` or `repo:`), and these permissions filled in. Choose
+the repositories, and click Generate token. GitHub Enterprise Server 3.19 and older don't
+fill in the page, so set these yourself there. The page is in GitHub's Settings, Developer
+settings, Personal access tokens, Fine-grained tokens:
 
 - Resource owner: the org, or you.
 - Repository access: the repos that open_prs must see.
@@ -288,7 +292,8 @@ For GitHub Enterprise, set `hostname`, and make the token on that host.
 
 ### A Forgejo or Gitea token
 
-Make a token in Settings, Applications, Access tokens, with these scopes:
+`ctrl+o` in the form opens the host's page for tokens: Settings, Applications, Access tokens.
+Give the token these scopes:
 
 - `read:repository`: the PRs, reviews, files, CI, who can review, and the repo's teams.
   `write:repository` only if `v` must ask for reviews.
