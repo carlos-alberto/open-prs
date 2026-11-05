@@ -470,11 +470,13 @@ impl Form {
 
     /// The repository permissions a GitHub token needs: the name on GitHub's page, the name in
     /// the page's URL, and the level. It may change PRs only while writes are on.
-    fn github_permissions(&self) -> [(&'static str, &'static str, &'static str); 3] {
+    fn github_permissions(&self) -> [(&'static str, &'static str, &'static str); 4] {
         let pull_requests = if self.writes { "write" } else { "read" };
         [
             ("Pull requests", "pull_requests", pull_requests),
             ("Commit statuses", "statuses", "read"),
+            // GitHub doesn't let these tokens read check runs, so CI comes from Actions' runs
+            ("Actions", "actions", "read"),
             ("Metadata", "metadata", "read"),
         ]
     }
@@ -811,7 +813,9 @@ mod tests {
         };
         assert_eq!(
             url,
-            format!("{page}&pull_requests=read&statuses=read&metadata=read&target_name=acme")
+            format!(
+                "{page}&pull_requests=read&statuses=read&actions=read&metadata=read&target_name=acme"
+            )
         );
 
         // With writes on, the token may change PRs; GitHub Enterprise has its own page
@@ -835,6 +839,7 @@ mod tests {
         for permission in [
             "  Pull requests: Read and write ",
             "  Commit statuses: Read ",
+            "  Actions: Read ",
             "  Metadata: Read ",
         ] {
             assert!(text.contains(permission), "{permission} in {text}");

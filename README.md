@@ -273,6 +273,7 @@ settings, Personal access tokens, Fine-grained tokens:
 - Repository permissions:
   - Pull requests: Read. Read and write only if `v` must ask for reviews.
   - Commit statuses: Read, for CI.
+  - Actions: Read, for the CI from GitHub Actions.
   - Metadata: Read. GitHub adds it.
   - Administration: Read, only if `v` must list the repo's teams. This also lets the token
     read the repo's settings. Without it, the reviewer panel has no teams.
@@ -283,8 +284,10 @@ Limits of fine-grained tokens:
   source, with a query such as `org:acme`, and its own token. A search across orgs, such as
   `involves:@me`, needs a classic token. A classic token needs the `repo` scope to read
   private repos, and that scope can write too.
-- GitHub's docs say that fine-grained tokens can't use the Checks API. CI from check runs,
-  such as GitHub Actions, may not show with such a token.
+- A fine-grained token can't read check runs. Thus open_prs gets the CI of each PR from its
+  commit statuses and its runs of GitHub Actions. Check runs from other apps don't show.
+  open_prs keeps the checks that are done for 10 minutes, to stay in GitHub's call limit.
+- A PR in a repo that the token can't see doesn't show.
 - An org can make its owners approve each fine-grained token, or block them.
 - A fine-grained token expires: by default after 30 days.
 - If the org uses SAML SSO, authorize the token for it. When GitHub asks for this, the error
