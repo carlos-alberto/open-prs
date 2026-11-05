@@ -7,7 +7,6 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Padding, Paragraph, Row, Table, TableState};
 
-use crate::app::wrap;
 use crate::config::{DEFAULT_QUERY, Kind, Login, Source, Token, check_url};
 use crate::sources::encode;
 
@@ -345,7 +344,11 @@ impl Form {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && self.token_auth =>
             {
                 match self.token_page() {
-                    Ok(url) => return FormAction::Open(url),
+                    Ok(url) => {
+                        // Ready to paste the token, with the list of what it needs in view
+                        self.focus = Field::Token;
+                        return FormAction::Open(url);
+                    }
                     Err((error, field)) => {
                         self.error = Some(error);
                         self.focus = field;
@@ -452,33 +455,63 @@ impl Form {
         let host = Some(self.hostname.trim())
             .filter(|h| !h.is_empty())
             .unwrap_or("github.com");
-        let pull_requests = if self.writes { "write" } else { "read" };
         let mut url = format!(
-            "https://{host}/settings/personal-access-tokens/new?name=open_prs&description={}\
-             &pull_requests={pull_requests}&statuses=read&metadata=read",
+            "https://{host}/settings/personal-access-tokens/new?name=open_prs&description={}",
             encode("PRs, reviews and CI for open_prs")
         );
+        for (_, param, level) in self.github_permissions() {
+            url.push_str(&format!("&{param}={level}"));
+        }
         if let Some(owner) = query_owner(&self.query) {
             url.push_str(&format!("&target_name={}", encode(owner)));
         }
         Ok(url)
     }
 
-    /// What the token field says while it has the focus: how to make a token.
-    fn token_help(&self) -> String {
-        if self.github {
-            return "ctrl+o opens GitHub's page for a new token, with its permissions filled in"
-                .into();
-        }
-        let write = if self.writes {
-            ", and write:repository for v"
+    /// The repository permissions a GitHub token needs: the name on GitHub's page, the name in
+    /// the page's URL, and the level. It may change PRs only while writes are on.
+    fn github_permissions(&self) -> [(&'static str, &'static str, &'static str); 3] {
+        let pull_requests = if self.writes { "write" } else { "read" };
+        [
+            ("Pull requests", "pull_requests", pull_requests),
+            ("Commit statuses", "statuses", "read"),
+            ("Metadata", "metadata", "read"),
+        ]
+    }
+
+    /// The scopes a Forgejo or Gitea token needs.
+    fn forgejo_scopes(&self) -> [&'static str; 3] {
+        let repository = if self.writes {
+            "write:repository"
         } else {
-            ""
+            "read:repository"
         };
-        format!(
-            "ctrl+o opens the host's page for tokens. Give the token read:repository, \
-             read:issue and read:user{write}"
-        )
+        [repository, "read:issue", "read:user"]
+    }
+
+    /// What the token field says while it has the focus: how to make a token, and what it
+    /// needs, in case the host's page doesn't keep what the URL filled in.
+    fn token_help(&self) -> Vec<String> {
+        if self.github {
+            let mut lines = vec![
+                "ctrl+o opens GitHub's page for a new token, with these filled in.".to_owned(),
+                "If the page lost them, give the token these repository permissions:".to_owned(),
+            ];
+            for (name, _, level) in self.github_permissions() {
+                let level = if level == "write" {
+                    "Read and write"
+                } else {
+                    "Read"
+                };
+                lines.push(format!("  {name}: {level}"));
+            }
+            return lines;
+        }
+        let mut lines = vec![
+            "ctrl+o opens the host's page for tokens. Give the token these scopes:".to_owned(),
+        ];
+        lines.extend(self.forgejo_scopes().map(|scope| format!("  {scope}")));
+        lines
     }
 
     fn submit(&mut self) -> FormAction {
@@ -554,8 +587,7 @@ impl Form {
             lines.push(Line::from(format!("tea logins: {}", self.logins.join(", "))).dim());
         }
         if self.focus == Field::Token {
-            // Inside the borders and the padding
-            for line in wrap(&self.token_help(), 76) {
+            for line in self.token_help() {
                 lines.push(Line::from(line).dim());
             }
         }
@@ -792,14 +824,27 @@ mod tests {
         assert!(url.contains("&pull_requests=write&"), "{url}");
         assert!(!url.contains("target_name"), "{url}");
 
-        // The token field says how, and the keys show it
-        form.focus = Field::Token;
+        // ctrl+o puts the focus on the token field, which lists what the token needs, in case
+        // the page lost it, and the keys show ctrl+o
+        assert_eq!(form.focus, Field::Token);
         let text = draw(&form);
         assert!(
             text.contains("ctrl+o opens GitHub's page for a new token"),
             "{text}"
         );
+        for permission in [
+            "  Pull requests: Read and write ",
+            "  Commit statuses: Read ",
+            "  Metadata: Read ",
+        ] {
+            assert!(text.contains(permission), "{permission} in {text}");
+        }
         assert!(text.contains(" ctrl+o  New token"), "{text}");
+        assert!(
+            text.contains("If the page lost them, give the token these repository permissions:")
+        );
+        form.writes = false;
+        assert!(draw(&form).contains("  Pull requests: Read "));
     }
 
     #[test]
@@ -813,10 +858,14 @@ mod tests {
             panic!("expected a page to open");
         };
         assert_eq!(url, "https://git.example.com/user/settings/applications");
-        form.focus = Field::Token;
+        assert_eq!(form.focus, Field::Token);
         let text = draw(&form);
-        assert!(text.contains("read:repository"), "{text}");
+        for scope in ["  read:repository ", "  read:issue ", "  read:user "] {
+            assert!(text.contains(scope), "{scope} in {text}");
+        }
         assert!(!text.contains("write:repository"), "{text}");
+        form.writes = true;
+        assert!(draw(&form).contains("  write:repository "));
 
         // A source that uses tea has no token, so ctrl+o does nothing
         form.token_auth = false;
