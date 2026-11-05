@@ -33,6 +33,8 @@ use crate::token::{self, Keychain};
 const TITLE: &str = "Open PRs";
 const COPIED_TIMEOUT: Duration = Duration::from_secs(5);
 const ERROR_TIMEOUT: Duration = Duration::from_secs(15);
+/// The toast about gh's and tea's logins stays longer, as it asks for a change
+const DEPRECATED_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The keys in the footer, most useful first; it shows as many as fit.
 const FOOTER: [(&str, &str); 19] = [
@@ -337,6 +339,7 @@ pub struct Options {
 pub fn run(options: Options, sources: Vec<Source>, origin: Origin, seen: Seen) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let mut app = App::new(options, sources, origin, seen, tx.clone());
+    app.warn_deprecated();
 
     let mut terminal = ratatui::init();
     let result = execute!(io::stdout(), EnableMouseCapture)
@@ -644,6 +647,19 @@ impl App {
                 );
             }
             Err(_) => {}
+        }
+    }
+
+    /// Says which sources use the login of gh or tea, and how to give them a token.
+    fn warn_deprecated(&mut self) {
+        let sources: Vec<Source> = self.feeds.iter().map(|f| f.source.clone()).collect();
+        if let Some(message) = config::deprecated(&sources) {
+            self.notify(
+                "gh and tea logins are deprecated".into(),
+                format!("{message} To give a source a token: s, then e, and pick token for Auth."),
+                true,
+                DEPRECATED_TIMEOUT,
+            );
         }
     }
 
@@ -2158,6 +2174,25 @@ mod tests {
     }
 
     #[test]
+    fn a_source_that_uses_gh_or_tea_gets_a_toast_at_the_start() {
+        let (mut with_gh, _rx) = app(Group::Repo, vec![github()]);
+        with_gh.warn_deprecated();
+        let toast = &with_gh.toasts[0];
+        assert_eq!(toast.title, "gh and tea logins are deprecated");
+        assert_eq!(
+            toast.message,
+            "GitHub uses gh's login. That is deprecated, and a later version will remove it. To \
+             give a source a token: s, then e, and pick token for Auth."
+        );
+        assert!(toast.until > Instant::now() + ERROR_TIMEOUT);
+
+        let token = github().with_token(crate::config::Token::default());
+        let (mut with_token, _rx) = app(Group::Repo, vec![token]);
+        with_token.warn_deprecated();
+        assert!(with_token.toasts.is_empty());
+    }
+
+    #[test]
     fn the_sources_panel_adds_edits_and_deletes() {
         let (mut app, _rx) = app(Group::Repo, vec![github()]);
         app.feeds[0].state = State::Failed("HTTP 401: Bad credentials\nTry gh auth login".into());
@@ -2169,8 +2204,11 @@ mod tests {
         // Only the first line of the error fits
         assert!(shows("GitHub failed: HTTP 401: Bad credentials "));
 
-        // gh's login has all its rights, and the panel says so
+        // gh's login has all its rights, and the panel says so, and that it is deprecated
         assert!(shows("GitHub uses gh's login, with all its rights"));
+        assert!(shows(
+            "This is deprecated. To give it a token, press e and pick token for Auth."
+        ));
 
         // Add a Forgejo source with a token, which goes in the keychain
         let keychain = Arc::new(token::tests::Fake::default());
