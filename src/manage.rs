@@ -7,7 +7,9 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Padding, Paragraph, Row, Table, TableState};
 
+use crate::app::wrap;
 use crate::config::{DEFAULT_QUERY, Kind, Login, Source, Token, check_url};
+use crate::sources::encode;
 
 /// The list of sources, over the table.
 #[derive(Default)]
@@ -187,6 +189,8 @@ pub struct Form {
     pub error: Option<String>,
     /// From `tea logins list`, to show which logins there are
     logins: Vec<String>,
+    /// Writes are on, so a new token may need write access
+    writes: bool,
 }
 
 pub enum FormAction {
@@ -194,6 +198,8 @@ pub enum FormAction {
     Cancel,
     /// The source, and a new token for the keychain if one was typed
     Save(Source, Option<String>),
+    /// Open this page, which makes a token, in the browser
+    Open(String),
 }
 
 impl Form {
@@ -216,7 +222,14 @@ impl Form {
             focus: Field::Kind,
             error: None,
             logins,
+            writes: false,
         }
+    }
+
+    /// The same form, for when writes are on or off.
+    pub fn with_writes(mut self, writes: bool) -> Self {
+        self.writes = writes;
+        self
     }
 
     /// A form for `source`; `saved` says if the keychain has its token.
@@ -328,6 +341,17 @@ impl Form {
         self.error = None;
         match key.code {
             KeyCode::Esc => return FormAction::Cancel,
+            KeyCode::Char('o')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && self.token_auth =>
+            {
+                match self.token_page() {
+                    Ok(url) => return FormAction::Open(url),
+                    Err((error, field)) => {
+                        self.error = Some(error);
+                        self.focus = field;
+                    }
+                }
+            }
             KeyCode::Enter => return self.submit(),
             KeyCode::Tab | KeyCode::Down => self.move_focus(1),
             KeyCode::BackTab | KeyCode::Up => self.move_focus(-1),
@@ -411,6 +435,52 @@ impl Form {
         Ok(source)
     }
 
+    /// The host's page that makes a token. GitHub's has the name, the owner from the query and
+    /// the permissions filled in; a write permission only while writes are on.
+    fn token_page(&self) -> Result<String, (String, Field)> {
+        if !self.github {
+            let source = self.build()?;
+            let Kind::Forgejo {
+                login: Login::Token { url, .. },
+                ..
+            } = &source.kind
+            else {
+                return Err(("Give the URL of the Forgejo or Gitea".into(), Field::Url));
+            };
+            return Ok(format!("{url}/user/settings/applications"));
+        }
+        let host = Some(self.hostname.trim())
+            .filter(|h| !h.is_empty())
+            .unwrap_or("github.com");
+        let pull_requests = if self.writes { "write" } else { "read" };
+        let mut url = format!(
+            "https://{host}/settings/personal-access-tokens/new?name=open_prs&description={}\
+             &pull_requests={pull_requests}&statuses=read&metadata=read",
+            encode("PRs, reviews and CI for open_prs")
+        );
+        if let Some(owner) = query_owner(&self.query) {
+            url.push_str(&format!("&target_name={}", encode(owner)));
+        }
+        Ok(url)
+    }
+
+    /// What the token field says while it has the focus: how to make a token.
+    fn token_help(&self) -> String {
+        if self.github {
+            return "ctrl+o opens GitHub's page for a new token, with its permissions filled in"
+                .into();
+        }
+        let write = if self.writes {
+            ", and write:repository for v"
+        } else {
+            ""
+        };
+        format!(
+            "ctrl+o opens the host's page for tokens. Give the token read:repository, \
+             read:issue and read:user{write}"
+        )
+    }
+
     fn submit(&mut self) -> FormAction {
         match self.source() {
             Ok(source) => {
@@ -483,15 +553,21 @@ impl Form {
         if !self.github && !self.token_auth && !self.logins.is_empty() {
             lines.push(Line::from(format!("tea logins: {}", self.logins.join(", "))).dim());
         }
+        if self.focus == Field::Token {
+            // Inside the borders and the padding
+            for line in wrap(&self.token_help(), 76) {
+                lines.push(Line::from(line).dim());
+            }
+        }
         if let Some(error) = &self.error {
             lines.push(Line::from(error.clone()).red());
         }
-        lines.push(keys(&[
-            ("tab", "Next"),
-            ("←→", "Choose"),
-            ("enter", "Save"),
-            ("esc", "Cancel"),
-        ]));
+        let mut shown = vec![("tab", "Next"), ("←→", "Choose"), ("enter", "Save")];
+        if self.token_auth {
+            shown.push(("ctrl+o", "New token"));
+        }
+        shown.push(("esc", "Cancel"));
+        lines.push(keys(&shown));
 
         let title = if self.editing.is_some() {
             " Edit the source "
@@ -509,6 +585,20 @@ impl Form {
             rect,
         );
     }
+}
+
+/// The owner in a GitHub search: the first `org:`, `user:` or `owner:` qualifier, or the owner
+/// in `repo:owner/name`.
+fn query_owner(query: &str) -> Option<&str> {
+    query.split_whitespace().find_map(|word| {
+        let (qualifier, value) = word.split_once(':')?;
+        let owner = match qualifier {
+            "org" | "user" | "owner" => value,
+            "repo" => value.split('/').next()?,
+            _ => return None,
+        };
+        Some(owner).filter(|o| !o.is_empty() && *o != "@me")
+    })
 }
 
 /// `text` with a capital letter at the start, as it starts a message.
@@ -669,6 +759,77 @@ mod tests {
             panic!("expected a save");
         };
         assert_eq!((again, token), (source, None));
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_o_opens_githubs_token_page_with_the_permissions_filled_in() {
+        let page = "https://github.com/settings/personal-access-tokens/new?name=open_prs\
+                    &description=PRs%2C%20reviews%20and%20CI%20for%20open_prs";
+        let mut form = Form::add(vec![]);
+        form.on_key(key(KeyCode::Tab));
+        form.on_key(key(KeyCode::Tab));
+        form.on_key(key(KeyCode::Tab));
+        typed(&mut form, "org:acme is:draft");
+        let FormAction::Open(url) = form.on_key(ctrl('o')) else {
+            panic!("expected a page to open");
+        };
+        assert_eq!(
+            url,
+            format!("{page}&pull_requests=read&statuses=read&metadata=read&target_name=acme")
+        );
+
+        // With writes on, the token may change PRs; GitHub Enterprise has its own page
+        let mut form = Form::add(vec![]).with_writes(true);
+        form.hostname = "ghe.acme.dev".into();
+        let FormAction::Open(url) = form.on_key(ctrl('o')) else {
+            panic!("expected a page to open");
+        };
+        assert!(url.starts_with("https://ghe.acme.dev/settings/personal-access-tokens/new?"));
+        assert!(url.contains("&pull_requests=write&"), "{url}");
+        assert!(!url.contains("target_name"), "{url}");
+
+        // The token field says how, and the keys show it
+        form.focus = Field::Token;
+        let text = draw(&form);
+        assert!(
+            text.contains("ctrl+o opens GitHub's page for a new token"),
+            "{text}"
+        );
+        assert!(text.contains(" ctrl+o  New token"), "{text}");
+    }
+
+    #[test]
+    fn ctrl_o_opens_the_forgejo_token_page_once_there_is_a_url() {
+        let mut form = Form::add(vec![]);
+        form.on_key(key(KeyCode::Right));
+        assert!(matches!(form.on_key(ctrl('o')), FormAction::None));
+        assert_eq!(form.focus, Field::Url);
+        typed(&mut form, "https://git.example.com/");
+        let FormAction::Open(url) = form.on_key(ctrl('o')) else {
+            panic!("expected a page to open");
+        };
+        assert_eq!(url, "https://git.example.com/user/settings/applications");
+        form.focus = Field::Token;
+        let text = draw(&form);
+        assert!(text.contains("read:repository"), "{text}");
+        assert!(!text.contains("write:repository"), "{text}");
+
+        // A source that uses tea has no token, so ctrl+o does nothing
+        form.token_auth = false;
+        assert!(matches!(form.on_key(ctrl('o')), FormAction::None));
+    }
+
+    #[test]
+    fn the_owner_comes_from_the_query() {
+        assert_eq!(query_owner("is:draft org:acme"), Some("acme"));
+        assert_eq!(query_owner("repo:acme/app"), Some("acme"));
+        assert_eq!(query_owner("user:bao"), Some("bao"));
+        assert_eq!(query_owner("involves:@me"), None);
+        assert_eq!(query_owner("user:@me"), None);
     }
 
     fn draw(form: &Form) -> String {

@@ -320,6 +320,8 @@ pub struct App {
     writes: bool,
     /// Where the form puts tokens; the tests use one in memory
     keychain: Arc<dyn Keychain>,
+    /// Opens a page in the browser; the tests replace it, so they don't start one
+    browse: fn(&str) -> Result<(), String>,
 }
 
 pub struct Options {
@@ -414,6 +416,7 @@ impl App {
             logins: || sources::tea_logins().unwrap_or_default(),
             writes: options.writes,
             keychain: Arc::new(token::Os),
+            browse: desktop::browse,
         }
     }
 
@@ -1012,13 +1015,14 @@ impl App {
             KeyCode::Down => list.cursor = (list.cursor + 1).min(self.feeds.len() - 1),
             KeyCode::Up => list.cursor = list.cursor.saturating_sub(1),
             KeyCode::Char('a') => {
-                self.mode = Mode::Form(Form::add((self.logins)()));
+                self.mode = Mode::Form(Form::add((self.logins)()).with_writes(self.writes));
                 return;
             }
             KeyCode::Char('e') | KeyCode::Enter => {
                 let source = &self.feeds[list.cursor].source;
                 let saved = source.token().is_some() && token::saved(&*self.keychain, source);
-                let form = Form::edit(list.cursor, source, (self.logins)(), saved);
+                let form = Form::edit(list.cursor, source, (self.logins)(), saved)
+                    .with_writes(self.writes);
                 self.mode = Mode::Form(form);
                 return;
             }
@@ -1038,6 +1042,14 @@ impl App {
         match form.on_key(key) {
             FormAction::None => self.mode = Mode::Form(form),
             FormAction::Cancel => self.mode = back(form.editing.unwrap_or(0)),
+            // The page to make a token, on the host the form names
+            FormAction::Open(url) => {
+                let opened = web_parts(&url, "It").and_then(|_| (self.browse)(&url));
+                if let Err(error) = opened {
+                    form.error = Some(format!("Could not open {url}: {error}"));
+                }
+                self.mode = Mode::Form(form);
+            }
             FormAction::Save(source, new_token) => {
                 let old = form.editing.map(|i| self.feeds[i].source.clone());
                 if let Err(error) = self.keep_token(old.as_ref(), &source, new_token.as_deref()) {
@@ -1155,28 +1167,8 @@ impl App {
             );
             return;
         }
-        let opener = if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
-        };
-        let child = desktop::command(opener)
-            .arg(url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        match child {
-            // Wait in the background, so the TUI doesn't stop while the browser starts
-            Ok(mut child) => {
-                thread::spawn(move || child.wait());
-            }
-            Err(e) => self.notify(
-                format!("Could not open {url}"),
-                format!("{opener}: {e}"),
-                true,
-                ERROR_TIMEOUT,
-            ),
+        if let Err(error) = (self.browse)(url) {
+            self.notify(format!("Could not open {url}"), error, true, ERROR_TIMEOUT);
         }
     }
 
@@ -1798,6 +1790,7 @@ mod tests {
         app.logins = || vec!["home".into()];
         // Never the real keychain
         app.keychain = Arc::new(token::tests::Fake::default());
+        app.browse = |_| panic!("a test opened the browser");
         (app, rx)
     }
 
@@ -2256,6 +2249,43 @@ mod tests {
 
         app.on_key(key(KeyCode::Esc));
         assert!(matches!(app.mode, Mode::Table));
+    }
+
+    thread_local! {
+        static OPENED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    #[test]
+    fn ctrl_o_in_the_form_opens_the_token_page_and_keeps_the_form() {
+        let (mut app, _rx) = app(Group::Repo, vec![github()]);
+        app.browse = |url| {
+            OPENED.with(|o| o.borrow_mut().push(url.into()));
+            Ok(())
+        };
+        app.on_key(key(KeyCode::Char('s')));
+        app.on_key(key(KeyCode::Char('a')));
+        app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(matches!(app.mode, Mode::Form(_)));
+        OPENED.with(|o| {
+            let opened = o.borrow();
+            assert_eq!(opened.len(), 1);
+            assert!(
+                opened[0].starts_with("https://github.com/settings/personal-access-tokens/new?")
+            );
+        });
+
+        // A browser that fails says so in the form
+        app.browse = |_| Err("open: not found".into());
+        app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        let Mode::Form(form) = &app.mode else {
+            panic!("expected the form");
+        };
+        assert!(
+            form.error
+                .as_deref()
+                .unwrap()
+                .ends_with(": open: not found")
+        );
     }
 
     #[test]
