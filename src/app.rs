@@ -172,7 +172,10 @@ const HELP: [(&str, &str); 23] = [
     ),
     ("esc", "Clear the words"),
     ("c", "Open the PR's CI runs"),
-    ("v", "Ask people to review the PR, or stop asking them"),
+    (
+        "v",
+        "Show who reviews the PR; with writes on, ask people or stop asking them",
+    ),
     ("y", "Copy the PR's URL"),
     ("r", "Reload now"),
     ("m", "Only PRs you opened"),
@@ -309,6 +312,9 @@ pub struct App {
     notifier: fn(&Notice),
     /// The tea logins for the form's hint
     logins: fn() -> Vec<String>,
+    /// Allow changes on the hosts. Only the config file and --writes turn it on, so a key
+    /// pressed by mistake can't
+    writes: bool,
 }
 
 pub struct Options {
@@ -317,6 +323,8 @@ pub struct Options {
     pub interval: Duration,
     /// Send desktop notifications
     pub notify: bool,
+    /// Allow changes on the hosts, such as review requests
+    pub writes: bool,
 }
 
 pub fn run(options: Options, sources: Vec<Source>, origin: Origin, seen: Seen) -> Result<()> {
@@ -399,6 +407,7 @@ impl App {
             notifier: notify::send,
             // Without tea, the form shows no hint
             logins: || sources::tea_logins().unwrap_or_default(),
+            writes: options.writes,
         }
     }
 
@@ -803,13 +812,15 @@ impl App {
             let result = load(&source, &pr, &known).map_err(|e| format!("{e:#}"));
             let _ = tx.send(Msg::ReviewersLoaded(pr.url, result));
         });
-        self.mode = Mode::Reviewers(Box::new(Picker::new(p)));
+        self.mode = Mode::Reviewers(Box::new(Picker::new(p, self.writes)));
     }
 
     fn on_reviewers_key(&mut self, mut picker: Box<Picker>, key: KeyEvent) {
         match picker.on_key(key) {
             reviewers::Action::None => {}
             reviewers::Action::Close => return,
+            // The panel doesn't save with writes off; this makes sure
+            reviewers::Action::Save(_) if !self.writes => {}
             reviewers::Action::Save(change) => {
                 let Some((_, source)) = self.source_of(&picker.pr) else {
                     picker.error = Some("The PR is gone from the table".into());
@@ -1160,6 +1171,9 @@ impl App {
         let mut parts = vec![count, format!("by {}", self.group.name())];
         if self.notifications {
             parts.push("notifications on".into());
+        }
+        if self.writes {
+            parts.push("writes on".into());
         }
         parts.extend(self.filter.describe());
         let mut loading: Vec<_> = self
@@ -1729,6 +1743,7 @@ mod tests {
             group,
             interval: Duration::from_secs(60),
             notify: false,
+            writes: false,
         };
         let mut app = App::new(options, sources, Origin::Flags, Seen::memory(), tx);
         app.load = |_| Ok(Vec::new());
@@ -1904,6 +1919,7 @@ mod tests {
 
     fn reviewers_app() -> (App, Receiver<Msg>) {
         let (mut app, rx) = app(Group::Repo, vec![github()]);
+        app.writes = true;
         app.load_reviewers = |_, _, known| {
             Ok(Reviewers {
                 requested: vec!["chidi".into()],
@@ -1966,6 +1982,26 @@ mod tests {
         app.on_key(key(KeyCode::Esc));
         app.on_key(key(KeyCode::Esc));
         assert!(matches!(app.mode, Mode::Table));
+    }
+
+    #[test]
+    fn v_with_writes_off_shows_who_reviews_but_saves_nothing() {
+        let (mut app, rx) = reviewers_app();
+        app.writes = false;
+        app.save_reviewers = |_, _, _| panic!("writes are off");
+        assert!(!app.subtitle().contains("writes on"));
+        app.on_key(key(KeyCode::Char('v')));
+        answer(&mut app, &rx);
+        let shown = screen(&mut app, 80, 24).join("\n");
+        assert!(shown.contains("│ ✓ chidi  asked"), "{shown}");
+        assert!(shown.contains("Writes are off"), "{shown}");
+        type_text(&mut app, "ba");
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.mode, Mode::Reviewers(_)));
+        assert!(rx.try_recv().is_err(), "nothing saves");
+
+        app.writes = true;
+        assert!(app.subtitle().contains(" · writes on"));
     }
 
     thread_local! {

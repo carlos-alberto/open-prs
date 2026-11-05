@@ -12,7 +12,8 @@ status and comments, and shows which PRs are stacked on which.
 - PRs that changed since you last saw them are bold, and marked `new`
 - `p` previews a PR: its description, the checks that didn't pass, the files and the last
   comments
-- `v` asks people or teams to review a PR, or stops asking them
+- `v` shows who reviews a PR. When you turn writes on, it asks people or teams to review
+  it, or stops asking them
 - Desktop notifications, if you turn them on with `b`: when a PR asks for your review, and
   when one of yours gets approved, gets changes requested or starts to fail CI
 - Stacked PRs show as a tree under the PR they are on
@@ -42,8 +43,8 @@ This puts `open_prs` in `~/.cargo/bin`. It needs:
 ```
 open_prs [-m/--mine] [-a/--approved | -n/--needs-review] [-w/--for-you] [-u/--new]
          [-f/--failing] [-d/--hide-drafts] [--text WORDS] [-g/--group repo|user]
-         [-i/--interval SECONDS] [--notify | --no-notify] [--github QUERY]...
-         [--forgejo LOGIN]...
+         [-i/--interval SECONDS] [--notify | --no-notify] [--writes | --no-writes]
+         [--github QUERY]... [--forgejo LOGIN]...
 ```
 
 With no sources, it shows the PRs on github.com that involve you. The flags set how the TUI
@@ -55,7 +56,7 @@ changes the words. It reloads every SECONDS (default 60).
 | `enter`, `o`, click the cursor row | Open the PR in the browser, and mark it as seen |
 | `p` | Preview the PR, and mark it as seen |
 | `c` | Open the PR's CI runs |
-| `v` | Ask people to review the PR, or stop asking them |
+| `v` | Show who reviews the PR; with writes on, ask people to review it or stop asking them |
 | `/` | Filter by words in the repo, number, title, author or host; `enter` keeps them, `esc` clears them |
 | `esc` | Clear the words |
 | `y` | Copy the PR's URL |
@@ -166,6 +167,13 @@ for someone it doesn't know.
 
 ![The reviewers of a PR: it asks bao, and the acme/backend team is ticked](docs/reviewers.svg)
 
+To ask for reviews, open_prs must change the PR on the host. It makes no change on a host
+until you turn writes on: put `writes = true` in the config file, or start it with
+`--writes`. `--no-writes` turns writes off for one run, whatever the file says. No key in the
+TUI turns writes on, so a key that you press by mistake cannot change a PR. While writes are
+off, `v` shows who reviews the PR, and says how to turn writes on. While writes are on, the
+header says `writes on`.
+
 The host tells each person it asks, so the panel says what `enter` does before you press
 it. On GitHub, the list has GitHub's suggestions, then the teams with access to the repo,
 then the users who can be assigned in it. tea can't list who can review on Forgejo and
@@ -184,6 +192,7 @@ Each source is a GitHub search or a tea login. They come from, in order:
 
 ```toml
 notify = true                  # desktop notifications; b sets it; default false
+writes = true                  # let v change the reviewers on the host; default false
 
 [[source]]
 kind = "github"
