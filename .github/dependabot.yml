@@ -1,0 +1,18 @@
+# Each week, a PR for each crate and each action that has a new version. The actions are
+# pinned to commit SHAs, and Dependabot updates the SHA and the comment after it.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # A new version waits a week, so a bad release is often yanked before it gets here
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
