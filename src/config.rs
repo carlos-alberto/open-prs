@@ -116,6 +116,8 @@ pub struct Config {
     pub origin: Origin,
     /// Send desktop notifications; `notify = true` in the file
     pub notify: bool,
+    /// Allow changes on the hosts, such as review requests; `writes = true` in the file
+    pub writes: bool,
 }
 
 #[derive(Deserialize)]
@@ -123,6 +125,8 @@ pub struct Config {
 struct File {
     #[serde(default)]
     notify: bool,
+    #[serde(default)]
+    writes: bool,
     #[serde(default)]
     source: Vec<Entry>,
 }
@@ -155,10 +159,11 @@ pub fn path() -> Option<PathBuf> {
 /// The sources to load, and the settings. The flags replace the config file, and with
 /// neither, it searches github.com for `involves:@me`.
 pub fn load(github: &[String], forgejo: &[String]) -> Result<Config> {
-    let config = |sources, origin, notify| Config {
+    let config = |sources, origin, (notify, writes)| Config {
         sources,
         origin,
         notify,
+        writes,
     };
     if !github.is_empty() || !forgejo.is_empty() {
         let github = github.iter().map(|q| Source::github(q, None, None));
@@ -166,22 +171,22 @@ pub fn load(github: &[String], forgejo: &[String]) -> Result<Config> {
         return Ok(config(
             github.chain(forgejo).collect(),
             Origin::Flags,
-            false,
+            (false, false),
         ));
     }
     let default = || vec![Source::github(DEFAULT_QUERY, None, None)];
     let Some(path) = path() else {
-        return Ok(config(default(), Origin::Nowhere, false));
+        return Ok(config(default(), Origin::Nowhere, (false, false)));
     };
     match fs::read_to_string(&path) {
         Ok(text) => {
             let file = read(&text).with_context(|| format!("{}", path.display()))?;
-            let notify = file.notify;
+            let settings = (file.notify, file.writes);
             let sources = sources(file).with_context(|| format!("{}", path.display()))?;
-            Ok(config(sources, Origin::File(path), notify))
+            Ok(config(sources, Origin::File(path), settings))
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {
-            Ok(config(default(), Origin::File(path), false))
+            Ok(config(default(), Origin::File(path), (false, false)))
         }
         Err(e) => Err(e).with_context(|| format!("could not read {}", path.display())),
     }
@@ -425,6 +430,17 @@ mod tests {
         );
         assert_eq!(config.origin, Origin::Flags);
         assert!(!config.notify);
+        assert!(!config.writes);
+    }
+
+    #[test]
+    fn writes_are_off_unless_the_file_turns_them_on() {
+        assert!(!read(FILE).unwrap().writes);
+        let text = format!("writes = true\n{FILE}");
+        assert!(read(&text).unwrap().writes);
+        assert_eq!(parse(&text).unwrap(), parse(FILE).unwrap());
+        let wrong = format!("writes = \"yes\"\n{FILE}");
+        assert!(read(&wrong).is_err());
     }
 
     #[test]

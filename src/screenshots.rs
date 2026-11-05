@@ -32,6 +32,7 @@ fn demo() -> App {
         group: Group::Repo,
         interval: Duration::from_secs(60),
         notify: false,
+        writes: false,
     };
     let mut app = App::new(options, sources, Origin::File(config), Seen::memory(), tx);
     app.load = |_| Ok(Vec::new());
@@ -212,8 +213,9 @@ fn screenshots() {
     }
     save("preview", &mut app, 100, 30);
 
-    // Who api #418 asks, and a team ticked
+    // Who api #418 asks, and a team ticked, with writes on as `v` needs
     app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    app.writes = true;
     app.on_key(key('v'));
     let url = app.selected().unwrap().url.clone();
     let reviewers = Reviewers {

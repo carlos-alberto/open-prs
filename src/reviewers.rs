@@ -74,6 +74,10 @@ fn matches(name: &str, text: &str) -> bool {
     }
 }
 
+/// What the panel says while writes are off.
+pub const WRITES_OFF: &str = "Writes are off, so this only shows who reviews. To ask for reviews, \
+    start open_prs with --writes, or put writes = true in the config file.";
+
 pub enum Action {
     None,
     Close,
@@ -94,6 +98,8 @@ pub struct Picker {
     pub saving: bool,
     /// Why the last save failed
     pub error: Option<String>,
+    /// It may change the reviewers; without it, it only shows them
+    writes: bool,
 }
 
 /// One row of the list.
@@ -105,7 +111,8 @@ enum Row {
 }
 
 impl Picker {
-    pub fn new(pr: Pr) -> Self {
+    /// The panel for `pr`; with `writes` false, it shows who reviews but changes nothing.
+    pub fn new(pr: Pr, writes: bool) -> Self {
         Picker {
             pr,
             content: None,
@@ -114,6 +121,7 @@ impl Picker {
             cursor: 0,
             saving: false,
             error: None,
+            writes,
         }
     }
 
@@ -191,7 +199,7 @@ impl Picker {
 
     /// Typing filters the people, space ticks the one under the cursor, and enter saves.
     /// With nothing ticked yet, enter ticks the one under the cursor first, so a name and
-    /// enter is enough.
+    /// enter is enough. While writes are off, space does nothing, and enter says why.
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
         if self.saving {
             return Action::None;
@@ -200,6 +208,8 @@ impl Picker {
         match key.code {
             KeyCode::Esc if !self.text.is_empty() => self.set_text(String::new()),
             KeyCode::Esc => return Action::Close,
+            KeyCode::Enter if !self.writes => self.error = Some(WRITES_OFF.into()),
+            KeyCode::Char(' ') if !self.writes => {}
             KeyCode::Enter => {
                 if self.reviewers().is_none() {
                     return Action::None;
@@ -251,10 +261,27 @@ impl Picker {
             Line::default(),
         ];
 
+        // What enter does, or why it can't
+        let change = self.change();
+        let wrapped = |text: &str| wrap(&clean(text), inner).into_iter().map(Line::raw);
+        let bottom: Vec<Line> = if self.saving {
+            vec![Line::raw("Saving…").dim()]
+        } else if let Some(error) = &self.error {
+            wrapped(error).map(Line::red).collect()
+        } else if !self.writes {
+            wrapped(WRITES_OFF).map(Line::dim).collect()
+        } else if change.is_empty() {
+            vec![Line::raw("space ticks a name, and enter asks them").dim()]
+        } else {
+            wrapped(&format!("enter {}", change.describe(false))).collect()
+        };
+
         // The rows that fit, with the cursor in them
-        // The borders, the words, two blank lines, a line for what enter does and one for
-        // the keys, and one more for when that says more
-        let room = usize::from(area.height.saturating_sub(9)).max(3);
+        // The borders, the words, two blank lines, the lines that say what enter does and one
+        // for the keys, and one more for when that says more
+        let room = usize::from(area.height)
+            .saturating_sub(8 + bottom.len())
+            .max(3);
         match &self.content {
             None => lines.push(Line::raw("Loading…").dim()),
             Some(Err(error)) => {
@@ -288,26 +315,13 @@ impl Picker {
         }
 
         lines.push(Line::default());
-        let change = self.change();
-        if self.saving {
-            lines.push(Line::raw("Saving…").dim());
-        } else if let Some(error) = &self.error {
-            lines.extend(
-                wrap(&clean(error), inner)
-                    .into_iter()
-                    .map(|l| Line::raw(l).red()),
-            );
-        } else if change.is_empty() {
-            lines.push(Line::raw("space ticks a name, and enter asks them").dim());
+        lines.extend(bottom);
+        let keys: &[(&str, &str)] = if self.writes {
+            &[("space", "Tick"), ("enter", "Save"), ("esc", "Close")]
         } else {
-            let what = format!("enter {}", change.describe(false));
-            lines.extend(wrap(&what, inner).into_iter().map(Line::raw));
-        }
-        lines.push(manage::keys(&[
-            ("space", "Tick"),
-            ("enter", "Save"),
-            ("esc", "Close"),
-        ]));
+            &[("esc", "Close")]
+        };
+        lines.push(manage::keys(keys));
 
         let rect = manage::popup(area, width, lines.len() as u16 + 2);
         let title = format!(" Reviewers of {} #{} ", self.pr.repo, self.pr.number);
@@ -375,7 +389,7 @@ mod tests {
     }
 
     fn picker() -> Picker {
-        let mut picker = Picker::new(pr("GitHub", "api", 418, "amy", Status::Needs));
+        let mut picker = Picker::new(pr("GitHub", "api", 418, "amy", Status::Needs), true);
         picker.loaded(Ok(Reviewers {
             requested: vec!["chidi".into()],
             people: vec!["bao".into(), "chidi".into(), "dana".into()],
@@ -408,7 +422,7 @@ mod tests {
 
     #[test]
     fn teams_match_on_their_slug() {
-        let mut picker = Picker::new(pr("GitHub", "api", 418, "amy", Status::Needs));
+        let mut picker = Picker::new(pr("GitHub", "api", 418, "amy", Status::Needs), true);
         picker.loaded(Ok(Reviewers {
             people: ["bao", "big-engine/engineering", "big-engine/product"]
                 .map(String::from)
@@ -477,7 +491,7 @@ mod tests {
 
     #[test]
     fn enter_does_nothing_while_it_loads_or_without_a_change() {
-        let mut picker = Picker::new(pr("GitHub", "api", 418, "amy", Status::Needs));
+        let mut picker = Picker::new(pr("GitHub", "api", 418, "amy", Status::Needs), true);
         assert!(matches!(picker.on_key(key(KeyCode::Enter)), Action::None));
         picker.loaded(Ok(Reviewers::default()));
         assert!(matches!(picker.on_key(key(KeyCode::Enter)), Action::None));
@@ -485,7 +499,7 @@ mod tests {
 
     #[test]
     fn the_list_says_how_many_more_names_there_are() {
-        let mut picker = Picker::new(pr("GitHub", "api", 418, "amy", Status::Needs));
+        let mut picker = Picker::new(pr("GitHub", "api", 418, "amy", Status::Needs), true);
         picker.loaded(Ok(Reviewers {
             people: (0..20).map(|i| format!("user{i}")).collect(),
             ..Reviewers::default()
@@ -512,6 +526,35 @@ mod tests {
             .collect();
         assert!(text.contains("user19 "), "{text}");
         assert!(text.contains("↑ 14 more above"), "{text}");
+    }
+
+    #[test]
+    fn with_writes_off_it_shows_who_reviews_and_changes_nothing() {
+        let mut picker = picker();
+        picker.writes = false;
+        let text = |picker: &Picker| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(64, 16)).unwrap();
+            terminal.draw(|f| picker.draw(f, f.area())).unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..16)
+                .map(|y| (0..64).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let shown = text(&picker);
+        assert!(shown.contains("✓ chidi  asked"), "{shown}");
+        assert!(shown.contains("Writes are off"), "{shown}");
+        assert!(shown.contains(" esc  Close"), "{shown}");
+        assert!(!shown.contains("Save"), "{shown}");
+
+        // Typing still filters, but space ticks no one, and enter only says why
+        type_text(&mut picker, "dan");
+        picker.on_key(key(KeyCode::Char(' ')));
+        assert!(picker.change().is_empty());
+        assert!(matches!(picker.on_key(key(KeyCode::Enter)), Action::None));
+        assert_eq!(picker.error.as_deref(), Some(WRITES_OFF));
+        assert!(picker.change().is_empty());
     }
 
     #[test]

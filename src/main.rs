@@ -38,7 +38,8 @@ use crate::seen::Seen;
     after_help = "Sources: --github and --forgejo replace the ones in the config file \
                   ($XDG_CONFIG_HOME/open_prs/config.toml, else ~/.config/open_prs/config.toml). \
                   With neither, it searches github.com for involves:@me.\n\
-                  Keys: enter/o open the PR in the browser, p preview it, v ask for reviews, \
+                  Keys: enter/o open the PR in the browser, p preview it, v ask for reviews \
+                  (with --writes or writes = true in the config file), \
                   y copy its URL, \
                   r reload now, \
                   m/a/n/w/u/f/d/g toggle the flags, / changes the words, space marks the PR \
@@ -86,6 +87,13 @@ struct Args {
     /// Don't send desktop notifications, whatever the config file says
     #[arg(long, overrides_with = "notify")]
     no_notify: bool,
+    /// Allow changes on the hosts, such as the review requests that v makes, as `writes = true`
+    /// in the config file does
+    #[arg(long, overrides_with = "no_writes")]
+    writes: bool,
+    /// Don't change anything on the hosts, whatever the config file says
+    #[arg(long, overrides_with = "writes")]
+    no_writes: bool,
     /// Seconds between reloads
     #[arg(short, long, value_name = "SECONDS", default_value_t = 60,
           value_parser = clap::value_parser!(u64).range(1..))]
@@ -139,6 +147,7 @@ fn main() -> ExitCode {
         group: args.group,
         interval: Duration::from_secs(args.interval),
         notify: !args.no_notify && (args.notify || config.notify),
+        writes: !args.no_writes && (args.writes || config.writes),
     };
     match app::run(options, config.sources, config.origin, seen) {
         Ok(()) => ExitCode::SUCCESS,
