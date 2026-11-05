@@ -2143,8 +2143,10 @@ mod tests {
         );
         // Comments are right-aligned under their 8-wide header, and blank for none
         assert!(lines[1].contains("Author  Comments  Updated"));
-        assert!(lines[2].contains(&format!("amy{}12  2965w", " ".repeat(11))));
-        assert!(lines[3].contains(&format!("me{}2965w", " ".repeat(16))));
+        // The PRs are from 1970, so their age grows each week
+        let weeks = age(DateTime::UNIX_EPOCH, Utc::now());
+        assert!(lines[2].contains(&format!("amy{}12  {weeks}", " ".repeat(11))));
+        assert!(lines[3].contains(&format!("me{}{weeks}", " ".repeat(16))));
         assert!(lines.iter().any(|l| l.contains(" GitHub failed ")));
         assert!(lines[11].starts_with(" o  Open"));
         assert!(lines[11].contains(" p  Preview"));
