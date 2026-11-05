@@ -22,73 +22,210 @@ pub struct Source {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// PRs that match a GitHub search, through gh
+    /// PRs that match a GitHub search
     GitHub {
         /// Search qualifiers, such as `org:rust-lang` or `repo:owner/name`
         query: String,
-        /// For GitHub Enterprise; gh uses github.com without it
+        /// For GitHub Enterprise; without it, github.com
         hostname: Option<String>,
+        /// Its own token; without one, it uses gh's login
+        token: Option<Token>,
     },
-    /// The open PRs a tea login can see, on Forgejo or Gitea
+    /// The open PRs on Forgejo or Gitea
     Forgejo {
-        /// A name from `tea logins list`
-        login: String,
+        login: Login,
         /// Only the repos of this user or org
         owner: Option<String>,
     },
 }
 
+/// How a Forgejo source logs in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Login {
+    /// A name from `tea logins list`: tea calls the host, with all the rights of that login
+    Tea(String),
+    /// The API of the Forgejo at `url`, with a token of its own
+    Token {
+        /// Such as https://git.example.com, without a / at the end
+        url: String,
+        /// The user allows an http `url`, as `allow_http = true`
+        allow_http: bool,
+        token: Token,
+    },
+}
+
+/// Where a source's token is, besides the keychain; see `token::find`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Token {
+    /// A program that prints the token, such as `op read op://Work/GitHub/token`
+    pub command: Option<String>,
+    /// The environment variable that holds the token
+    pub env: Option<String>,
+}
+
 impl Source {
+    /// A GitHub search through gh's login.
     pub fn github(query: &str, hostname: Option<String>, name: Option<String>) -> Self {
         Source {
             name,
             kind: Kind::GitHub {
                 query: query.into(),
                 hostname,
+                token: None,
             },
         }
     }
 
+    /// A Forgejo or Gitea through a tea login.
     pub fn forgejo(login: &str, owner: Option<String>, name: Option<String>) -> Self {
         Source {
             name,
             kind: Kind::Forgejo {
-                login: login.into(),
+                login: Login::Tea(login.into()),
                 owner,
             },
         }
     }
 
-    /// Shown in the Host column: the name the user gave, else the GitHub hostname or the tea
-    /// login. tea names a login after its host by default, so the login makes a good name.
-    pub fn name(&self) -> &str {
-        match (&self.name, &self.kind) {
-            (Some(name), _) => name,
-            (
-                None,
-                Kind::GitHub {
-                    hostname: Some(hostname),
-                    ..
+    /// The Forgejo or Gitea at `url`, with a token from the keychain.
+    #[cfg(test)]
+    pub fn forgejo_api(url: &str, owner: Option<String>, name: Option<String>) -> Self {
+        Source {
+            name,
+            kind: Kind::Forgejo {
+                login: Login::Token {
+                    url: url.into(),
+                    allow_http: false,
+                    token: Token::default(),
                 },
-            ) => hostname,
-            (None, Kind::GitHub { .. }) => "GitHub",
-            (None, Kind::Forgejo { login, .. }) => login,
+                owner,
+            },
+        }
+    }
+
+    /// The same GitHub source with a token of its own, from `token`.
+    pub fn with_token(mut self, new: Token) -> Self {
+        if let Kind::GitHub { token, .. } = &mut self.kind {
+            *token = Some(new);
+        }
+        self
+    }
+
+    /// Shown in the Host column: the name the user gave, else the GitHub hostname, the tea
+    /// login or the Forgejo's host. tea names a login after its host by default, so the login
+    /// makes a good name.
+    pub fn name(&self) -> &str {
+        if let Some(name) = &self.name {
+            return name;
+        }
+        match &self.kind {
+            Kind::GitHub {
+                hostname: Some(hostname),
+                ..
+            } => hostname,
+            Kind::GitHub { .. } => "GitHub",
+            Kind::Forgejo {
+                login: Login::Tea(login),
+                ..
+            } => login,
+            Kind::Forgejo {
+                login: Login::Token { url, .. },
+                ..
+            } => url_host(url),
+        }
+    }
+
+    /// The host it calls; for a tea login, the login's name.
+    pub fn host(&self) -> &str {
+        match &self.kind {
+            Kind::GitHub { hostname, .. } => hostname.as_deref().unwrap_or("github.com"),
+            Kind::Forgejo {
+                login: Login::Tea(login),
+                ..
+            } => login,
+            Kind::Forgejo {
+                login: Login::Token { url, .. },
+                ..
+            } => url_host(url),
         }
     }
 
     /// What it searches, in a few words.
     pub fn describe(&self) -> String {
         match &self.kind {
-            Kind::GitHub { query, hostname } => {
-                format!("{}: {query}", hostname.as_deref().unwrap_or("github.com"))
+            Kind::GitHub { query, .. } => format!("{}: {query}", self.host()),
+            Kind::Forgejo { login, owner } => {
+                let at = match login {
+                    Login::Tea(login) => format!("tea login {login}"),
+                    Login::Token { .. } => self.host().to_owned(),
+                };
+                match owner {
+                    Some(owner) => format!("{at}, {owner}'s repos"),
+                    None => at,
+                }
             }
-            Kind::Forgejo { login, owner: None } => format!("tea login {login}"),
-            Kind::Forgejo {
-                login,
-                owner: Some(owner),
-            } => format!("tea login {login}, {owner}'s repos"),
         }
     }
+
+    /// Where its token is, or None when it uses gh's or tea's login.
+    pub fn token(&self) -> Option<&Token> {
+        match &self.kind {
+            Kind::GitHub { token, .. } => token.as_ref(),
+            Kind::Forgejo {
+                login: Login::Token { token, .. },
+                ..
+            } => Some(token),
+            Kind::Forgejo { .. } => None,
+        }
+    }
+
+    /// The program whose login it uses, gh or tea, or None when it has a token of its own.
+    pub fn cli(&self) -> Option<&'static str> {
+        match &self.kind {
+            Kind::GitHub { token: None, .. } => Some("gh"),
+            Kind::Forgejo {
+                login: Login::Tea(_),
+                ..
+            } => Some("tea"),
+            _ => None,
+        }
+    }
+
+    /// Its token's account in the keychain: `<kind>:<host>:<name>`.
+    pub fn account(&self) -> String {
+        let kind = match self.kind {
+            Kind::GitHub { .. } => "github",
+            Kind::Forgejo { .. } => "forgejo",
+        };
+        format!("{kind}:{}:{}", self.host(), self.name())
+    }
+}
+
+/// The host of `url`, with any port: git.example.com in https://git.example.com/forgejo.
+pub fn url_host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split(['/', '?', '#']).next().unwrap_or(rest)
+}
+
+/// `url` without a / at the end, if it is a web address that open_prs may send a token to:
+/// https, or http when the user allows it.
+pub fn check_url(url: &str, allow_http: bool) -> Result<String> {
+    let url = url.trim().trim_end_matches('/');
+    let lower = url.to_ascii_lowercase();
+    let host = url_host(url);
+    if !lower.starts_with("https://") && !lower.starts_with("http://") {
+        bail!("{url} isn't a web address, such as https://git.example.com");
+    }
+    if lower.starts_with("http://") && !allow_http {
+        bail!(
+            "{url} uses http, which sends the token as plain text; use https, or put \
+             allow_http = true on the source"
+        );
+    }
+    if host.is_empty() || host.contains(['@', ' ', '\\']) {
+        bail!("{url} has no host that open_prs can use");
+    }
+    Ok(url.to_owned())
 }
 
 /// Where the sources came from, which says where changes to them go.
@@ -138,13 +275,31 @@ enum Entry {
         name: Option<String>,
         query: Option<String>,
         hostname: Option<String>,
+        auth: Option<Auth>,
+        token_command: Option<String>,
+        token_env: Option<String>,
     },
     #[serde(alias = "gitea")]
     Forgejo {
         name: Option<String>,
-        login: String,
+        login: Option<String>,
+        url: Option<String>,
         owner: Option<String>,
+        auth: Option<Auth>,
+        token_command: Option<String>,
+        token_env: Option<String>,
+        allow_http: Option<bool>,
     },
+}
+
+/// The `auth` key: how a source logs in. Without it, a source uses gh or tea.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum Auth {
+    /// A token of its own
+    Token,
+    Gh,
+    Tea,
 }
 
 /// `$XDG_CONFIG_HOME/open_prs/config.toml`, else `~/.config/open_prs/config.toml`.
@@ -204,18 +359,93 @@ fn sources(file: File) -> Result<Vec<Source>> {
     if file.source.is_empty() {
         bail!("there is no [[source]] in the file");
     }
-    Ok(file
-        .source
+    file.source
         .into_iter()
-        .map(|entry| match entry {
-            Entry::Github {
+        .zip(1..)
+        .map(|(entry, i)| source(entry).with_context(|| format!("[[source]] number {i}")))
+        .collect()
+}
+
+fn source(entry: Entry) -> Result<Source> {
+    // The token keys mean nothing to gh or tea, so they must not look as if they work
+    let token = |auth: Option<Auth>, command: Option<String>, env: Option<String>| {
+        if auth != Some(Auth::Token) && (command.is_some() || env.is_some()) {
+            bail!("token_command and token_env need auth = \"token\"");
+        }
+        Ok(Token { command, env })
+    };
+    match entry {
+        Entry::Github {
+            name,
+            query,
+            hostname,
+            auth,
+            token_command,
+            token_env,
+        } => {
+            let found = token(auth, token_command, token_env)?;
+            let token = match auth {
+                None | Some(Auth::Gh) => None,
+                Some(Auth::Token) => Some(found),
+                Some(Auth::Tea) => bail!("a github source has auth = \"token\" or \"gh\""),
+            };
+            let query = query.unwrap_or_else(|| DEFAULT_QUERY.into());
+            Ok(Source {
                 name,
-                query,
-                hostname,
-            } => Source::github(query.as_deref().unwrap_or(DEFAULT_QUERY), hostname, name),
-            Entry::Forgejo { name, login, owner } => Source::forgejo(&login, owner, name),
-        })
-        .collect())
+                kind: Kind::GitHub {
+                    query,
+                    hostname,
+                    token,
+                },
+            })
+        }
+        Entry::Forgejo {
+            name,
+            login,
+            url,
+            owner,
+            auth,
+            token_command,
+            token_env,
+            allow_http,
+        } => {
+            let found = token(auth, token_command, token_env)?;
+            let login = match auth {
+                None | Some(Auth::Tea) => {
+                    if url.is_some() || allow_http.is_some() {
+                        bail!(
+                            "url and allow_http need auth = \"token\"; tea knows its login's host"
+                        );
+                    }
+                    let login = login.context(
+                        "a forgejo source needs login, a name from `tea logins list`, or \
+                         auth = \"token\" and url",
+                    )?;
+                    Login::Tea(login)
+                }
+                Some(Auth::Token) => {
+                    if login.is_some() {
+                        bail!("login is for tea; with auth = \"token\", give url");
+                    }
+                    let url = url.context(
+                        "a forgejo source with auth = \"token\" needs url, such as \
+                         https://git.example.com",
+                    )?;
+                    let allow_http = allow_http.unwrap_or(false);
+                    Login::Token {
+                        url: check_url(&url, allow_http)?,
+                        allow_http,
+                        token: found,
+                    }
+                }
+                Some(Auth::Gh) => bail!("a forgejo source has auth = \"token\" or \"tea\""),
+            };
+            Ok(Source {
+                name,
+                kind: Kind::Forgejo { login, owner },
+            })
+        }
+    }
 }
 
 /// Makes `change` to the `[[source]]` tables in the file at `path`, which must still hold
@@ -311,25 +541,46 @@ fn table(source: &Source) -> Table {
 
 /// Puts `source` in `table`, and changes only the keys that differ.
 fn write(table: &mut Table, source: &Source) {
+    let none = Token::default();
+    let token = source.token().unwrap_or(&none);
+    // A source that uses gh or tea keeps an auth key that says so, and gets none when it has none
+    let auth = match source.cli() {
+        Some(cli) => table
+            .get("auth")
+            .and_then(Item::as_str)
+            .filter(|a| *a == cli)
+            .map(|_| cli),
+        None => Some("token"),
+    };
     let (kind, keys) = match &source.kind {
-        Kind::GitHub { query, hostname } => (
+        Kind::GitHub {
+            query, hostname, ..
+        } => (
             "github",
             [
                 ("query", Some(query.as_str())),
                 ("hostname", hostname.as_deref()),
                 ("login", None),
+                ("url", None),
                 ("owner", None),
             ],
         ),
-        Kind::Forgejo { login, owner } => (
-            "forgejo",
-            [
-                ("login", Some(login.as_str())),
-                ("owner", owner.as_deref()),
-                ("query", None),
-                ("hostname", None),
-            ],
-        ),
+        Kind::Forgejo { login, owner } => {
+            let (login, url) = match login {
+                Login::Tea(login) => (Some(login.as_str()), None),
+                Login::Token { url, .. } => (None, Some(url.as_str())),
+            };
+            (
+                "forgejo",
+                [
+                    ("login", login),
+                    ("url", url),
+                    ("owner", owner.as_deref()),
+                    ("query", None),
+                    ("hostname", None),
+                ],
+            )
+        }
     };
     // gitea means the same as forgejo, so a file that says gitea keeps it
     let same_kind = table
@@ -342,6 +593,26 @@ fn write(table: &mut Table, source: &Source) {
     set(table, "name", source.name.as_deref());
     for (key, value) in keys {
         set(table, key, value);
+    }
+    set(table, "auth", auth);
+    set(table, "token_command", token.command.as_deref());
+    set(table, "token_env", token.env.as_deref());
+    let allow_http = matches!(
+        &source.kind,
+        Kind::Forgejo {
+            login: Login::Token {
+                allow_http: true,
+                ..
+            },
+            ..
+        }
+    );
+    if allow_http {
+        if table.get("allow_http").and_then(Item::as_bool) != Some(true) {
+            table.insert("allow_http", toml_edit::value(true));
+        }
+    } else {
+        table.remove("allow_http");
     }
 }
 
@@ -411,7 +682,7 @@ mod tests {
         let error = |text| format!("{:#}", parse(text).unwrap_err());
         assert!(error("").contains("no [[source]]"));
         assert!(error("[[source]]\nkind = \"gitlab\"").contains("unknown variant `gitlab`"));
-        assert!(error("[[source]]\nkind = \"forgejo\"").contains("missing field `login`"));
+        assert!(error("[[source]]\nkind = \"forgejo\"").contains("needs login"));
         assert!(
             error("[[source]]\nkind = \"github\"\nqeury = \"x\"").contains("unknown field `qeury`")
         );
@@ -581,5 +852,141 @@ login = "home"
         let error = save(&file.0, &stale, &Change::Remove(0)).unwrap_err();
         assert!(format!("{error:#}").contains("changed since open_prs read it"));
         assert_eq!(file.read(), FILE);
+    }
+
+    #[test]
+    fn parse_reads_the_token_keys() {
+        let sources = parse(
+            r#"
+            [[source]]
+            kind = "github"
+            query = "org:acme"
+            auth = "token"
+            token_command = "op read op://Work/GitHub/token"
+
+            [[source]]
+            kind = "github"
+            auth = "gh"
+
+            [[source]]
+            kind = "forgejo"
+            url = "http://git.example.com:3000/"
+            owner = "acme"
+            auth = "token"
+            token_env = "FORGEJO_TOKEN"
+            allow_http = true
+            "#,
+        )
+        .unwrap();
+        let command = Token {
+            command: Some("op read op://Work/GitHub/token".into()),
+            env: None,
+        };
+        assert_eq!(
+            sources[0],
+            Source::github("org:acme", None, None).with_token(command)
+        );
+        assert_eq!(sources[1], Source::github(DEFAULT_QUERY, None, None));
+        assert_eq!(sources[1].cli(), Some("gh"));
+        assert_eq!(
+            sources[2].kind,
+            Kind::Forgejo {
+                login: Login::Token {
+                    url: "http://git.example.com:3000".into(),
+                    allow_http: true,
+                    token: Token {
+                        command: None,
+                        env: Some("FORGEJO_TOKEN".into()),
+                    },
+                },
+                owner: Some("acme".into()),
+            }
+        );
+        assert_eq!(sources[2].name(), "git.example.com:3000");
+        assert_eq!(
+            sources[2].account(),
+            "forgejo:git.example.com:3000:git.example.com:3000"
+        );
+        assert_eq!(sources[0].account(), "github:github.com:GitHub");
+    }
+
+    #[test]
+    fn parse_rejects_token_keys_that_would_do_nothing() {
+        let error = |text: &str| format!("{:#}", parse(text).unwrap_err());
+        let forgejo = "[[source]]\nkind = \"forgejo\"\n";
+        assert!(error(&format!("{forgejo}auth = \"token\"")).contains("needs url"));
+        assert!(
+            error(&format!("{forgejo}auth = \"token\"\nurl = \"http://x\""))
+                .contains("put allow_http = true on the source")
+        );
+        assert!(
+            error(&format!("{forgejo}login = \"home\"\nurl = \"https://x\""))
+                .contains("url and allow_http need auth = \"token\"")
+        );
+        assert!(
+            error(&format!(
+                "{forgejo}auth = \"token\"\nurl = \"https://x\"\nlogin = \"home\""
+            ))
+            .contains("login is for tea")
+        );
+        assert!(
+            error("[[source]]\nkind = \"github\"\ntoken_env = \"T\"")
+                .contains("[[source]] number 1: token_command and token_env need auth = \"token\"")
+        );
+        assert!(
+            error("[[source]]\nkind = \"github\"\nauth = \"tea\"").contains("\"token\" or \"gh\"")
+        );
+        assert!(
+            error("[[source]]\nkind = \"github\"\nauth = \"pat\"")
+                .contains("unknown variant `pat`")
+        );
+    }
+
+    #[test]
+    fn save_adds_the_token_keys_and_keeps_comments() {
+        let file = TempFile::new("token", Some(FILE));
+        let mut current = parse(FILE).unwrap();
+
+        // As the form makes them: a token for GitHub, and the Forgejo through its API
+        let github = current[0].clone().with_token(Token::default());
+        save(&file.0, &current, &Change::Update(0, github.clone())).unwrap();
+        current[0] = github;
+        let forgejo = Source::forgejo_api("https://git.example.com", Some("me".into()), None);
+        save(&file.0, &current, &Change::Update(1, forgejo.clone())).unwrap();
+        current[1] = forgejo;
+        assert_eq!(
+            file.read(),
+            r#"# My sources
+[[source]]
+kind = "github"
+query = "org:acme"  # work
+auth = "token"
+
+# The Forgejo at home
+[[source]]
+kind = "gitea"
+owner = "me"
+url = "https://git.example.com"
+auth = "token"
+"#
+        );
+        assert_eq!(parse(&file.read()).unwrap(), current);
+
+        // Back to gh: the auth key goes, and a token_env that the file had goes with it
+        let back = Source::github("org:acme", None, None);
+        save(&file.0, &current, &Change::Update(0, back.clone())).unwrap();
+        current[0] = back;
+        assert!(!file.read().contains("auth = \"token\"\n\n# The Forgejo"));
+        assert_eq!(parse(&file.read()).unwrap(), current);
+    }
+
+    #[test]
+    fn save_keeps_an_auth_key_that_names_gh_or_tea() {
+        let text = format!("{FILE}auth = \"tea\"  # the old way\n");
+        let file = TempFile::new("auth", Some(&text));
+        let current = parse(&text).unwrap();
+        let renamed = Source::forgejo("home", Some("me".into()), Some("Home".into()));
+        save(&file.0, &current, &Change::Update(1, renamed)).unwrap();
+        assert!(file.read().contains("auth = \"tea\"  # the old way\n"));
     }
 }

@@ -8,58 +8,161 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use crate::config::{Kind, Source};
+use crate::config::{Kind, Login, Source};
+use crate::http::{Client, Http, Refused};
 use crate::pr::{Ci, Pr, Status};
 use crate::preview::{self, Check, Comment, FileChange, Files, Preview};
 use crate::reviewers::{self as review, Reviewers};
+use crate::token;
 
 pub fn fetch(source: &Source) -> Result<Vec<Pr>> {
-    match &source.kind {
-        Kind::GitHub { query, hostname } => github(source.name(), query, hostname.as_deref()),
-        Kind::Forgejo { login, owner } => forgejo(source.name(), login, owner.as_deref()),
-    }
+    let found = match &source.kind {
+        Kind::GitHub {
+            query,
+            hostname,
+            token: None,
+        } => github(source.name(), query, &Gh::Cli(hostname.as_deref())),
+        Kind::GitHub {
+            query, hostname, ..
+        } => {
+            let http = api(source)?;
+            github(source.name(), query, &Gh::api(&http, hostname.as_deref()))
+        }
+        Kind::Forgejo {
+            login: Login::Tea(login),
+            owner,
+        } => forgejo(source.name(), login, owner.as_deref()),
+        Kind::Forgejo { owner, .. } => forgejo_api(source.name(), &api(source)?, owner.as_deref()),
+    };
+    refused(source, found)
 }
 
 /// The description, checks, files and last comments of `pr`, which `source` found.
 pub fn preview(source: &Source, pr: &Pr) -> Result<Preview> {
-    match &source.kind {
-        Kind::GitHub { hostname, .. } => github_preview(&pr.url, hostname.as_deref()),
-        Kind::Forgejo { login, .. } => forgejo_preview(login, &pr.repo, pr.number),
-    }
+    let found = match &source.kind {
+        Kind::GitHub {
+            hostname,
+            token: None,
+            ..
+        } => github_preview(&pr.url, &Gh::Cli(hostname.as_deref())),
+        Kind::GitHub { hostname, .. } => {
+            let http = api(source)?;
+            github_preview(&pr.url, &Gh::api(&http, hostname.as_deref()))
+        }
+        Kind::Forgejo {
+            login: Login::Tea(login),
+            ..
+        } => forgejo_preview(login, &pr.repo, pr.number),
+        Kind::Forgejo { .. } => forgejo_api_preview(&api(source)?, &pr.repo, pr.number),
+    };
+    refused(source, found)
 }
 
 /// Who reviews `pr`, which `source` found, and who can. `known` is the people in the
-/// source's PRs, for Forgejo, which tea can't ask who can review.
+/// source's PRs, for a tea login, which can't ask who can review.
 pub fn reviewers(source: &Source, pr: &Pr, known: &[String]) -> Result<Reviewers> {
-    match &source.kind {
-        Kind::GitHub { hostname, .. } => github_reviewers(pr, hostname.as_deref()),
-        Kind::Forgejo { login, .. } => forgejo_reviewers(login, pr, known),
-    }
+    let found = match &source.kind {
+        Kind::GitHub {
+            hostname,
+            token: None,
+            ..
+        } => github_reviewers(pr, &Gh::Cli(hostname.as_deref())),
+        Kind::GitHub { hostname, .. } => {
+            let http = api(source)?;
+            github_reviewers(pr, &Gh::api(&http, hostname.as_deref()))
+        }
+        Kind::Forgejo {
+            login: Login::Tea(login),
+            ..
+        } => forgejo_reviewers(login, pr, known),
+        Kind::Forgejo { .. } => forgejo_api_reviewers(&api(source)?, pr),
+    };
+    refused(source, found)
 }
 
 /// Asks for the reviews in `change.add` and stops asking for the ones in `change.remove`.
 pub fn request_reviews(source: &Source, pr: &Pr, change: &review::Change) -> Result<()> {
-    match &source.kind {
-        Kind::GitHub { hostname, .. } => {
-            for args in github_review_calls(&pr.repo, pr.number, change) {
-                let mut cmd = vec!["gh", "api"];
-                if let Some(hostname) = hostname {
-                    cmd.extend(["--hostname", hostname]);
-                }
-                cmd.extend(args.iter().map(String::as_str));
-                run(&cmd)?;
-            }
-            Ok(())
+    let done = match &source.kind {
+        Kind::GitHub {
+            hostname,
+            token: None,
+            ..
+        } => {
+            let gh = Gh::Cli(hostname.as_deref());
+            github_review_calls(&pr.repo, pr.number, change)
+                .iter()
+                .try_for_each(|call| gh.review(call))
         }
-        Kind::Forgejo { login, .. } => {
+        Kind::GitHub { hostname, .. } => {
+            let http = api(source)?;
+            let gh = Gh::api(&http, hostname.as_deref());
+            github_review_calls(&pr.repo, pr.number, change)
+                .iter()
+                .try_for_each(|call| gh.review(call))
+        }
+        Kind::Forgejo {
+            login: Login::Tea(login),
+            ..
+        } => {
             let args = forgejo_review_args(login, &pr.repo, pr.number, change);
             let mut cmd = vec!["tea"];
             cmd.extend(args.iter().map(String::as_str));
             run(&cmd).map(|_| ())
         }
+        Kind::Forgejo { .. } => {
+            let http = api(source)?;
+            review_calls(&format!("repos/{}/pulls/{}", pr.repo, pr.number), change)
+                .iter()
+                .try_for_each(|call| {
+                    http.send(call.method, &format!("/{}", call.endpoint), &call.json())
+                        .map(|_| ())
+                })
+        }
+    };
+    refused(source, done)
+}
+
+/// The client for a source with a token of its own.
+fn api(source: &Source) -> Result<Client> {
+    let token = token::get(source)?;
+    match &source.kind {
+        Kind::GitHub { hostname, .. } => {
+            let base = match hostname.as_deref() {
+                None | Some("github.com") => "https://api.github.com".to_owned(),
+                Some(hostname) => format!("https://{hostname}/api/v3"),
+            };
+            let auth = format!("Bearer {}", token.expose());
+            Client::new(&base, auth, source.name(), false, true)
+        }
+        Kind::Forgejo {
+            login: Login::Token {
+                url, allow_http, ..
+            },
+            ..
+        } => {
+            let auth = format!("token {}", token.expose());
+            Client::new(
+                &format!("{url}/api/v1"),
+                auth,
+                source.name(),
+                *allow_http,
+                false,
+            )
+        }
+        Kind::Forgejo { .. } => bail!("{} uses tea's login", source.name()),
     }
+}
+
+/// When the host refused the token, looks for it again next time, as the user may fix it.
+fn refused<T>(source: &Source, result: Result<T>) -> Result<T> {
+    if let Err(e) = &result
+        && e.downcast_ref::<Refused>().is_some()
+    {
+        token::forget(source);
+    }
+    result
 }
 
 /// The names of the logins tea has, to help pick one.
@@ -73,8 +176,13 @@ fn logins() -> Result<Vec<TeaLogin>> {
 }
 
 fn run(cmd: &[&str]) -> Result<String> {
+    let mut command = Command::new(cmd[0]);
+    // gh and tea need their own settings, but not the tokens of the other sources
+    for name in token::hidden() {
+        command.env_remove(name);
+    }
     // stdin is null, so gh or tea can't read the keys meant for the TUI
-    let out = Command::new(cmd[0])
+    let out = command
         .args(&cmd[1..])
         .stdin(Stdio::null())
         .output()
@@ -93,6 +201,141 @@ fn run(cmd: &[&str]) -> Result<String> {
         }
     }
     String::from_utf8(out.stdout).with_context(|| format!("{} printed invalid UTF-8", cmd[0]))
+}
+
+/// How a GitHub source reaches GitHub: through gh's login, or the API with its own token.
+/// Each gives the same JSON, so only this changes.
+enum Gh<'a> {
+    /// gh, with the hostname for GitHub Enterprise
+    Cli(Option<&'a str>),
+    Api {
+        http: &'a dyn Http,
+        /// Where GraphQL is: /graphql on api.github.com, /api/graphql on GitHub Enterprise
+        graphql: String,
+    },
+}
+
+impl<'a> Gh<'a> {
+    fn api(http: &'a dyn Http, hostname: Option<&str>) -> Self {
+        let graphql = match hostname {
+            None | Some("github.com") => "/graphql".to_owned(),
+            Some(hostname) => format!("https://{hostname}/api/graphql"),
+        };
+        Gh::Api { http, graphql }
+    }
+
+    /// `gh api` with `args`.
+    fn gh(hostname: Option<&str>, args: &[&str]) -> Result<String> {
+        let mut cmd = vec!["gh", "api"];
+        if let Some(hostname) = hostname {
+            cmd.extend(["--hostname", hostname]);
+        }
+        cmd.extend(args);
+        run(&cmd)
+    }
+
+    /// Runs `query` with `vars`. With `paginate`, it reads every page of the connection with
+    /// pageInfo, as `gh api graphql --paginate` does, and gives one JSON document per page.
+    fn graphql(&self, query: &str, vars: &[(&str, &str)], paginate: bool) -> Result<String> {
+        let (http, endpoint) = match self {
+            Gh::Cli(hostname) => {
+                let fields: Vec<String> = vars
+                    .iter()
+                    .map(|(name, value)| format!("{name}={value}"))
+                    .chain([format!("query={query}")])
+                    .collect();
+                let mut args = vec!["graphql"];
+                if paginate {
+                    args.push("--paginate");
+                }
+                for field in &fields {
+                    args.extend(["-f", field]);
+                }
+                return Self::gh(*hostname, &args);
+            }
+            Gh::Api { http, graphql } => (http, graphql),
+        };
+        let mut out = String::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut variables: serde_json::Map<String, Value> = vars
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), Value::from(*value)))
+                .collect();
+            if let Some(cursor) = &cursor {
+                variables.insert("endCursor".into(), cursor.as_str().into());
+            }
+            let body = json!({ "query": query, "variables": variables });
+            let reply = http.send("POST", endpoint, &body)?;
+            let page: Value =
+                serde_json::from_str(&reply).context("could not read the reply from GitHub")?;
+            if let Some(errors) = page.get("errors").and_then(Value::as_array)
+                && !errors.is_empty()
+            {
+                let messages: Vec<&str> = errors
+                    .iter()
+                    .filter_map(|e| e.get("message")?.as_str())
+                    .collect();
+                bail!("GitHub: {}", messages.join("; "));
+            }
+            out.push_str(&reply);
+            out.push('\n');
+            match page_info(&page) {
+                Some(next) if paginate => cursor = Some(next),
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// GETs a REST endpoint and its next pages: one JSON document per page, as
+    /// `gh api --paginate` prints them.
+    fn pages(&self, endpoint: &str) -> Result<String> {
+        let http = match self {
+            Gh::Cli(hostname) => return Self::gh(*hostname, &[endpoint, "--paginate"]),
+            Gh::Api { http, .. } => http,
+        };
+        let mut out = String::new();
+        let mut next = Some(format!("/{endpoint}?per_page=100"));
+        while let Some(path) = next {
+            let reply = http.get(&path)?;
+            out.push_str(&reply.body);
+            out.push('\n');
+            next = reply.next;
+        }
+        Ok(out)
+    }
+
+    fn review(&self, call: &ReviewCall) -> Result<()> {
+        match self {
+            Gh::Cli(hostname) => {
+                let args = call.gh_args();
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                Self::gh(*hostname, &args).map(|_| ())
+            }
+            Gh::Api { http, .. } => http
+                .send(call.method, &format!("/{}", call.endpoint), &call.json())
+                .map(|_| ()),
+        }
+    }
+}
+
+/// The cursor of the next page, from the first pageInfo in the reply that has one.
+fn page_info(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            if let Some(info) = map.get("pageInfo") {
+                return info
+                    .get("hasNextPage")?
+                    .as_bool()?
+                    .then(|| info.get("endCursor")?.as_str().map(str::to_owned))
+                    .flatten();
+            }
+            map.values().find_map(page_info)
+        }
+        Value::Array(items) => items.iter().find_map(page_info),
+        _ => None,
+    }
 }
 
 const GITHUB_QUERY: &str = "
@@ -228,16 +471,10 @@ struct GhState {
     state: String,
 }
 
-fn github(name: &str, query: &str, hostname: Option<&str>) -> Result<Vec<Pr>> {
+fn github(name: &str, query: &str, via: &Gh) -> Result<Vec<Pr>> {
     let gh = |search: &str, graphql: &str| {
-        let search = format!("q=is:pr is:open {search}");
-        let graphql = format!("query={graphql}");
-        let mut cmd = vec!["gh", "api"];
-        if let Some(hostname) = hostname {
-            cmd.extend(["--hostname", hostname]);
-        }
-        cmd.extend(["graphql", "--paginate", "-f", &search, "-f", &graphql]);
-        run(&cmd)
+        let search = format!("is:pr is:open {search}");
+        via.graphql(graphql, &[("q", &search)], true)
     };
     // review-requested also finds requests to your teams, which the PR's own list of
     // reviewers can't tell apart from other teams'
@@ -256,7 +493,7 @@ fn github(name: &str, query: &str, hostname: Option<&str>) -> Result<Vec<Pr>> {
 fn parse_urls(out: &str) -> Result<HashSet<String>> {
     let mut urls = HashSet::new();
     for page in serde_json::Deserializer::from_str(out).into_iter::<GhUrlPage>() {
-        let page = page.context("could not read the reply from gh")?;
+        let page = page.context("could not read the reply from GitHub")?;
         urls.extend(
             page.data
                 .search
@@ -272,14 +509,15 @@ fn parse_github(name: &str, out: &str) -> Result<Vec<Pr>> {
     let mut prs = Vec::new();
     // --paginate prints one JSON document per page
     for page in serde_json::Deserializer::from_str(out).into_iter::<GhPage>() {
-        let page = page.context("could not read the reply from gh")?;
+        let page = page.context("could not read the reply from GitHub")?;
         let me = page.data.viewer.login;
         for node in page.data.search.nodes {
             // A search result that isn't a PR comes back as null or {}
             if node.as_object().is_none_or(|o| o.is_empty()) {
                 continue;
             }
-            let n: GhPr = serde_json::from_value(node).context("could not read a PR from gh")?;
+            let n: GhPr =
+                serde_json::from_value(node).context("could not read a PR from GitHub")?;
             // reviewDecision is null when the repo does not require reviews, so fall back to the latest verdicts
             let decision = n.review_decision.or_else(|| {
                 let states = n.latest_opinionated_reviews.nodes;
@@ -438,21 +676,14 @@ enum GhContext {
     },
 }
 
-fn github_preview(url: &str, hostname: Option<&str>) -> Result<Preview> {
-    let query = format!("query={GITHUB_PREVIEW_QUERY}");
-    let url_field = format!("url={url}");
-    let mut cmd = vec!["gh", "api"];
-    if let Some(hostname) = hostname {
-        cmd.extend(["--hostname", hostname]);
-    }
-    cmd.extend(["graphql", "-f", &query, "-f", &url_field]);
-    parse_github_preview(&run(&cmd)?)
+fn github_preview(url: &str, via: &Gh) -> Result<Preview> {
+    parse_github_preview(&via.graphql(GITHUB_PREVIEW_QUERY, &[("url", url)], false)?)
 }
 
 fn parse_github_preview(out: &str) -> Result<Preview> {
     let page: GhPreviewPage =
-        serde_json::from_str(out).context("could not read the reply from gh")?;
-    let pr = page.data.resource.context("gh found no such PR")?;
+        serde_json::from_str(out).context("could not read the reply from GitHub")?;
+    let pr = page.data.resource.context("GitHub found no such PR")?;
     let login = |a: Option<GhLogin>| a.map_or_else(|| "ghost".into(), |a| a.login);
     let mut comments: Vec<Comment> = pr
         .comments
@@ -609,24 +840,15 @@ struct GhTeam {
     slug: String,
 }
 
-fn github_reviewers(pr: &Pr, hostname: Option<&str>) -> Result<Reviewers> {
-    let gh = |args: &[&str]| {
-        let mut cmd = vec!["gh", "api"];
-        if let Some(hostname) = hostname {
-            cmd.extend(["--hostname", hostname]);
-        }
-        cmd.extend(args);
-        run(&cmd)
-    };
-    let query = format!("query={GITHUB_REVIEWERS_QUERY}");
-    let url_field = format!("url={}", pr.url);
+fn github_reviewers(pr: &Pr, via: &Gh) -> Result<Reviewers> {
     let teams_endpoint = format!("repos/{}/teams", pr.repo);
     let (out, teams) = thread::scope(|s| {
-        let teams = s.spawn(|| gh(&[&teams_endpoint, "--paginate"]));
-        let out = gh(&["graphql", "-f", &query, "-f", &url_field]);
+        let teams = s.spawn(|| via.pages(&teams_endpoint));
+        let out = via.graphql(GITHUB_REVIEWERS_QUERY, &[("url", &pr.url)], false);
         (out, teams.join().unwrap())
     });
-    // The people still work without the teams, as when no one may see them
+    // The people still work without the teams, as when no one may see them, or a token
+    // without the large permission that lists them
     let teams = teams
         .and_then(|out| github_teams(&out, pr.owner()))
         .unwrap_or_default();
@@ -638,7 +860,7 @@ fn github_teams(out: &str, owner: &str) -> Result<Vec<String>> {
     let mut teams = Vec::new();
     // --paginate prints one JSON array per page
     for page in serde_json::Deserializer::from_str(out).into_iter::<Vec<GhTeam>>() {
-        let page = page.context("could not read the teams from gh")?;
+        let page = page.context("could not read the teams from GitHub")?;
         teams.extend(page.into_iter().map(|t| format!("{owner}/{}", t.slug)));
     }
     Ok(teams)
@@ -647,8 +869,8 @@ fn github_teams(out: &str, owner: &str) -> Result<Vec<String>> {
 /// The people are GitHub's suggestions, then `teams`, then the users who can be assigned.
 fn parse_github_reviewers(out: &str, teams: Vec<String>) -> Result<Reviewers> {
     let page: GhReviewersPage =
-        serde_json::from_str(out).context("could not read the reply from gh")?;
-    let pr = page.data.resource.context("gh found no such PR")?;
+        serde_json::from_str(out).context("could not read the reply from GitHub")?;
+    let pr = page.data.resource.context("GitHub found no such PR")?;
     let author = pr.author.map(|a| a.login);
     let requested = pr
         .review_requests
@@ -702,25 +924,60 @@ fn parse_github_reviewers(out: &str, teams: Vec<String>) -> Result<Reviewers> {
     })
 }
 
-/// The `gh api` calls that make `change`: a team is org/slug, and GitHub wants the slug.
-fn github_review_calls(repo: &str, number: u64, change: &review::Change) -> Vec<Vec<String>> {
-    let endpoint = format!("repos/{repo}/pulls/{number}/requested_reviewers");
-    let call = |method: &str, names: &[String]| {
-        let mut args = vec!["-X".to_owned(), method.to_owned(), endpoint.clone()];
-        let (teams, users): (Vec<&String>, Vec<&String>) =
-            names.iter().partition(|n| n.contains('/'));
+/// A call that asks for reviews, or stops asking for them.
+#[derive(Debug, PartialEq, Eq)]
+struct ReviewCall {
+    /// POST to ask, DELETE to stop asking
+    method: &'static str,
+    /// From the API's base, without a / at the start
+    endpoint: String,
+    users: Vec<String>,
+    /// The teams' names, without the org
+    teams: Vec<String>,
+}
+
+impl ReviewCall {
+    /// The arguments to `gh api`.
+    fn gh_args(&self) -> Vec<String> {
+        let mut args = vec![
+            "-X".to_owned(),
+            self.method.to_owned(),
+            self.endpoint.clone(),
+        ];
         // GitHub wants reviewers, if only empty
-        if users.is_empty() {
+        if self.users.is_empty() {
             args.extend(["-f".into(), "reviewers[]".into()]);
         }
-        for user in users {
+        for user in &self.users {
             args.extend(["-f".into(), format!("reviewers[]={user}")]);
         }
-        for team in teams {
-            let slug = team.rsplit('/').next().unwrap_or(team);
-            args.extend(["-f".into(), format!("team_reviewers[]={slug}")]);
+        for team in &self.teams {
+            args.extend(["-f".into(), format!("team_reviewers[]={team}")]);
         }
         args
+    }
+
+    /// The body for the API, which GitHub and Forgejo take alike.
+    fn json(&self) -> Value {
+        json!({ "reviewers": self.users, "team_reviewers": self.teams })
+    }
+}
+
+/// The calls that make `change` to the PR at `pull`, such as repos/acme/app/pulls/7. A team is
+/// org/name, and the host wants only the name.
+fn review_calls(pull: &str, change: &review::Change) -> Vec<ReviewCall> {
+    let call = |method, names: &[String]| {
+        let (teams, users): (Vec<&String>, Vec<&String>) =
+            names.iter().partition(|n| n.contains('/'));
+        ReviewCall {
+            method,
+            endpoint: format!("{pull}/requested_reviewers"),
+            users: users.into_iter().cloned().collect(),
+            teams: teams
+                .into_iter()
+                .map(|t| t.rsplit('/').next().unwrap_or(t).to_owned())
+                .collect(),
+        }
     };
     let mut calls = Vec::new();
     if !change.add.is_empty() {
@@ -730,6 +987,10 @@ fn github_review_calls(repo: &str, number: u64, change: &review::Change) -> Vec<
         calls.push(call("DELETE", &change.remove));
     }
     calls
+}
+
+fn github_review_calls(repo: &str, number: u64, change: &review::Change) -> Vec<ReviewCall> {
+    review_calls(&format!("repos/{repo}/pulls/{number}"), change)
 }
 
 fn github_ci(state: &str) -> Option<Ci> {
@@ -1146,6 +1407,340 @@ fn forgejo_checks_url(pr_url: &str) -> String {
     }
 }
 
+#[derive(Deserialize)]
+struct FjUser {
+    login: String,
+}
+
+/// A PR in the search of every repo.
+#[derive(Deserialize)]
+struct FjIssue {
+    number: u64,
+    title: String,
+    html_url: String,
+    user: FjUser,
+    updated_at: DateTime<Utc>,
+    repository: FjRepo,
+}
+
+#[derive(Deserialize)]
+struct FjRepo {
+    full_name: String,
+}
+
+#[derive(Deserialize)]
+struct FjPull {
+    #[serde(default)]
+    body: Option<String>,
+    user: Option<FjUser>,
+    /// False while it has a conflict, but also while it is a draft or Forgejo checks it
+    #[serde(default)]
+    mergeable: bool,
+    base: FjBranch,
+    head: FjBranch,
+    /// Forgejo's count: each comment in the conversation and each review counts once
+    #[serde(default)]
+    comments: u64,
+    #[serde(default)]
+    additions: u64,
+    #[serde(default)]
+    deletions: u64,
+    #[serde(default)]
+    changed_files: u64,
+}
+
+#[derive(Deserialize)]
+struct FjBranch {
+    #[serde(rename = "ref")]
+    name: String,
+    sha: String,
+    /// A head in another repo than the base is from a fork
+    #[serde(default)]
+    repo_id: i64,
+}
+
+#[derive(Deserialize)]
+struct FjReview {
+    id: i64,
+    /// None when it asks a team
+    user: Option<FjUser>,
+    team: Option<FjTeam>,
+    state: String,
+    #[serde(default)]
+    body: String,
+    submitted_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Deserialize)]
+struct FjTeam {
+    name: String,
+}
+
+/// The combined state of a commit's checks, and each check.
+#[derive(Deserialize)]
+struct FjStatus {
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    total_count: u64,
+    #[serde(default)]
+    statuses: Option<Vec<FjCheck>>,
+}
+
+#[derive(Deserialize)]
+struct FjCheck {
+    context: String,
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct FjFile {
+    filename: String,
+    #[serde(default)]
+    additions: u64,
+    #[serde(default)]
+    deletions: u64,
+}
+
+#[derive(Deserialize)]
+struct FjComment {
+    user: Option<FjUser>,
+    #[serde(default)]
+    body: String,
+    created_at: DateTime<Utc>,
+}
+
+/// GETs `path` and reads the reply as JSON.
+fn get_json<T: DeserializeOwned>(http: &dyn Http, path: &str) -> Result<T> {
+    let reply = http.get(path)?;
+    serde_json::from_str(&reply.body).with_context(|| format!("could not read the reply to {path}"))
+}
+
+/// GETs `path` and the pages after it, as the Link header gives them, until there are `most`
+/// items or no more pages.
+fn get_all<T: DeserializeOwned>(http: &dyn Http, path: &str, most: usize) -> Result<Vec<T>> {
+    let mut items = Vec::new();
+    let mut next = Some(path.to_owned());
+    while let Some(path) = next
+        && items.len() < most
+    {
+        let reply = http.get(&path)?;
+        let page: Vec<T> = serde_json::from_str(&reply.body)
+            .with_context(|| format!("could not read the reply to {path}"))?;
+        if page.is_empty() {
+            break;
+        }
+        items.extend(page);
+        next = reply.next;
+    }
+    items.truncate(most);
+    Ok(items)
+}
+
+/// `text` for a URL's query: letters, digits and -._~ as they are, the rest as %XX.
+fn encode(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            b => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// The reviews as tea gives them, so the rules for tea apply to them too. A request to a team
+/// is from `owner/team`, as the reviewer panel names teams.
+fn fj_reviews(reviews: Vec<FjReview>, owner: &str) -> Vec<TeaReview> {
+    reviews
+        .into_iter()
+        .filter_map(|r| {
+            let reviewer = match (r.user, r.team) {
+                (Some(user), _) => user.login,
+                (None, Some(team)) => format!("{owner}/{}", team.name),
+                (None, None) => return None,
+            };
+            Some(TeaReview {
+                id: r.id,
+                reviewer,
+                state: r.state,
+                body: r.body,
+                created: r.submitted_at,
+            })
+        })
+        .collect()
+}
+
+/// The open PRs that a token can see on a Forgejo or Gitea, through its API.
+fn forgejo_api(name: &str, http: &dyn Http, owner: Option<&str>) -> Result<Vec<Pr>> {
+    let me: FjUser = get_json(http, "/user")?;
+    let mut search = "/repos/issues/search?type=pulls&state=open&limit=50".to_owned();
+    // Without an owner, a public instance returns the PRs of every public repo
+    if let Some(owner) = owner {
+        search.push_str(&format!("&owner={}", encode(owner)));
+    }
+    let listed: Vec<FjIssue> = get_all(http, &search, usize::MAX)?;
+
+    // A few calls for each PR, side by side
+    let status = |issue: &FjIssue| -> Result<Pr> {
+        let repo = &issue.repository.full_name;
+        let pull_path = format!("/repos/{repo}/pulls/{}", issue.number);
+        let pull: FjPull = get_json(http, &pull_path)?;
+        let reviews: Vec<FjReview> = get_all(http, &format!("{pull_path}/reviews?limit=50"), 500)?;
+        let ci: FjStatus = get_json(
+            http,
+            &format!("/repos/{repo}/commits/{}/status", pull.head.sha),
+        )?;
+        let owner = repo.split('/').next().unwrap_or_default();
+        let reviews = fj_reviews(reviews, owner);
+        let draft = forgejo_draft(&issue.title);
+        Ok(Pr {
+            host: name.into(),
+            number: issue.number,
+            repo: repo.clone(),
+            title: issue.title.clone(),
+            url: issue.html_url.clone(),
+            checks_url: forgejo_checks_url(&issue.html_url),
+            author: issue.user.login.clone(),
+            status: forgejo_status(&reviews),
+            ci: if ci.total_count == 0 {
+                None
+            } else {
+                forgejo_ci_state(&ci.state)
+            },
+            updated: issue.updated_at,
+            mine: issue.user.login == me.login,
+            requested: forgejo_requested(&reviews, &me.login),
+            new: false,
+            draft,
+            conflict: !pull.mergeable && !draft,
+            comments: pull.comments,
+            base: pull.base.name,
+            head: if pull.head.repo_id == pull.base.repo_id {
+                pull.head.name
+            } else {
+                String::new()
+            },
+            parent: None,
+            tree: String::new(),
+        })
+    };
+    par_map(&listed, 8, status).into_iter().collect()
+}
+
+/// The PR, its reviews and its comments, as tea gives them with --comments.
+fn forgejo_api_pull(http: &dyn Http, repo: &str, number: u64) -> Result<(FjPull, TeaPullDetail)> {
+    let pull_path = format!("/repos/{repo}/pulls/{number}");
+    let (pull, reviews, comments) = thread::scope(|s| {
+        let reviews =
+            s.spawn(|| get_all::<FjReview>(http, &format!("{pull_path}/reviews?limit=50"), 500));
+        let comments = s.spawn(|| {
+            get_json::<Vec<FjComment>>(http, &format!("/repos/{repo}/issues/{number}/comments"))
+        });
+        (
+            get_json::<FjPull>(http, &pull_path),
+            reviews.join().unwrap(),
+            comments.join().unwrap(),
+        )
+    });
+    let mut pull = pull?;
+    let owner = repo.split('/').next().unwrap_or_default();
+    let detail = TeaPullDetail {
+        user: pull
+            .user
+            .as_ref()
+            .map(|u| u.login.clone())
+            .unwrap_or_default(),
+        body: pull.body.take().unwrap_or_default(),
+        reviews: Some(fj_reviews(reviews?, owner)),
+        comments: Some(
+            comments?
+                .into_iter()
+                .map(|c| TeaComment {
+                    author: c.user.map_or_else(|| "ghost".into(), |u| u.login),
+                    created: c.created_at,
+                    body: c.body,
+                })
+                .collect(),
+        ),
+    };
+    Ok((pull, detail))
+}
+
+fn forgejo_api_preview(http: &dyn Http, repo: &str, number: u64) -> Result<Preview> {
+    let (pull, detail) = forgejo_api_pull(http, repo, number)?;
+    let (files, ci) = thread::scope(|s| {
+        let files = s.spawn(|| {
+            get_all::<FjFile>(
+                http,
+                &format!("/repos/{repo}/pulls/{number}/files?limit=50"),
+                100,
+            )
+        });
+        let ci = get_json::<FjStatus>(
+            http,
+            &format!("/repos/{repo}/commits/{}/status", pull.head.sha),
+        );
+        (files.join().unwrap(), ci)
+    });
+    let mut preview = forgejo_preview_from(detail);
+    preview.files = Some(Files {
+        additions: pull.additions,
+        deletions: pull.deletions,
+        count: pull.changed_files,
+        changed: files?
+            .into_iter()
+            .map(|f| FileChange {
+                path: f.filename,
+                additions: f.additions,
+                deletions: f.deletions,
+            })
+            .collect(),
+    });
+    preview.checks = ci?
+        .statuses
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| Check {
+            name: c.context,
+            state: match c.status.as_str() {
+                // As on GitHub, a skipped check doesn't need a look
+                "skipped" => Ci::Passed,
+                status => forgejo_ci_state(status).unwrap_or(Ci::Pending),
+            },
+        })
+        .collect();
+    Ok(preview)
+}
+
+/// Who reviews the PR, and who can: the people the host suggests, then the repo's teams.
+fn forgejo_api_reviewers(http: &dyn Http, pr: &Pr) -> Result<Reviewers> {
+    let repo = &pr.repo;
+    let ((_, detail), can, teams) = thread::scope(|s| {
+        let can = s.spawn(|| get_json::<Vec<FjUser>>(http, &format!("/repos/{repo}/reviewers")));
+        let teams = s.spawn(|| get_json::<Vec<FjTeam>>(http, &format!("/repos/{repo}/teams")));
+        let pull = forgejo_api_pull(http, repo, pr.number);
+        Ok::<_, anyhow::Error>((pull?, can.join().unwrap()?, teams.join().unwrap()))
+    })?;
+    let author = detail.user.clone();
+    let mut reviewers = forgejo_reviewers_from(detail, &[]);
+    // A repo of a user, not an org, has no teams
+    let teams = teams.unwrap_or_default();
+    let names = can.into_iter().map(|u| u.login).chain(
+        teams
+            .into_iter()
+            .map(|t| format!("{}/{}", pr.owner(), t.name)),
+    );
+    let mut people = Vec::new();
+    for name in names {
+        if name != author && !people.contains(&name) {
+            people.push(name);
+        }
+    }
+    reviewers.people = people;
+    Ok(reviewers)
+}
+
 /// `f` over `items` on up to `threads` threads, with the results in the order of `items`.
 fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let next = AtomicUsize::new(0);
@@ -1173,6 +1768,7 @@ fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::Reply;
 
     fn review(id: i64, reviewer: &str, state: &str) -> TeaReview {
         TeaReview {
@@ -1270,8 +1866,9 @@ mod tests {
         };
         let calls = github_review_calls("acme/api", 418, &change);
         let endpoint = "repos/acme/api/pulls/418/requested_reviewers";
+        let args: Vec<Vec<String>> = calls.iter().map(ReviewCall::gh_args).collect();
         assert_eq!(
-            calls,
+            args,
             [
                 vec![
                     "-X",
@@ -1294,6 +1891,15 @@ mod tests {
             ]
         );
         assert!(github_review_calls("acme/api", 418, &review::Change::default()).is_empty());
+        // The API takes the same as a JSON body
+        assert_eq!(
+            calls[0].json(),
+            json!({ "reviewers": ["bao"], "team_reviewers": ["api"] })
+        );
+        assert_eq!(
+            calls[1].json(),
+            json!({ "reviewers": [], "team_reviewers": ["web"] })
+        );
     }
 
     #[test]
@@ -1596,5 +2202,266 @@ mod tests {
                 None
             ]
         );
+    }
+
+    /// Canned replies from an API, and the calls made to it, in order.
+    struct Canned {
+        answer: fn(&str, &str, Option<&Value>) -> Option<Reply>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl Canned {
+        fn new(answer: fn(&str, &str, Option<&Value>) -> Option<Reply>) -> Self {
+            Canned {
+                answer,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Http for Canned {
+        fn get(&self, path: &str) -> Result<Reply> {
+            self.calls.lock().unwrap().push(format!("GET {path}"));
+            (self.answer)("GET", path, None).with_context(|| format!("no reply to GET {path}"))
+        }
+
+        fn send(&self, method: &str, path: &str, body: &Value) -> Result<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{method} {path} {body}"));
+            (self.answer)(method, path, Some(body))
+                .map(|r| r.body)
+                .with_context(|| format!("no reply to {method} {path}"))
+        }
+    }
+
+    fn body(text: &str) -> Option<Reply> {
+        Some(Reply {
+            body: text.into(),
+            next: None,
+        })
+    }
+
+    /// A PR in GitHub's search, with only what parse_github needs.
+    fn gh_node(number: u64) -> String {
+        format!(
+            r#"{{"number":{number},"title":"t","url":"u{number}","reviewDecision":null,"updatedAt":"2026-11-04T09:07:15Z","isDraft":false,"mergeable":"MERGEABLE","baseRefName":"main","headRefName":"b{number}","author":{{"login":"me"}},"repository":{{"nameWithOwner":"acme/r"}},"headRepository":{{"nameWithOwner":"acme/r"}},"latestOpinionatedReviews":{{"nodes":[]}},"commits":{{"nodes":[]}},"comments":{{"totalCount":0}},"reviewThreads":{{"nodes":[]}}}}"#
+        )
+    }
+
+    #[test]
+    fn github_through_the_api_reads_every_page_and_the_requests() {
+        let canned = Canned::new(|method, path, sent| {
+            assert_eq!((method, path), ("POST", "/graphql"));
+            let sent = sent?;
+            let variables = &sent["variables"];
+            let search = |more: bool, cursor: &str, nodes: &str| {
+                format!(
+                    r#"{{"data":{{"viewer":{{"login":"me"}},"search":{{"pageInfo":{{"hasNextPage":{more},"endCursor":{cursor}}},"nodes":[{nodes}]}}}}}}"#
+                )
+            };
+            if variables["q"] == "is:pr is:open org:acme review-requested:@me" {
+                return body(&search(false, "null", r#"{"url":"u2"}"#));
+            }
+            assert_eq!(variables["q"], "is:pr is:open org:acme");
+            match variables.get("endCursor").and_then(Value::as_str) {
+                None => body(&search(true, r#""c1""#, &gh_node(1))),
+                Some("c1") => body(&search(false, "null", &gh_node(2))),
+                Some(_) => None,
+            }
+        });
+        let prs = github("GitHub", "org:acme", &Gh::api(&canned, None)).unwrap();
+        let got: Vec<_> = prs.iter().map(|p| (p.number, p.requested)).collect();
+        assert_eq!(got, [(1, false), (2, true)]);
+        assert_eq!(canned.calls().len(), 3);
+    }
+
+    #[test]
+    fn github_through_the_api_fails_with_graphqls_errors() {
+        let canned = Canned::new(|_, _, _| {
+            body(
+                r#"{"data":null,"errors":[{"message":"Resource not accessible by personal access token"}]}"#,
+            )
+        });
+        let error = github_preview("u1", &Gh::api(&canned, None)).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "GitHub: Resource not accessible by personal access token"
+        );
+    }
+
+    #[test]
+    fn github_enterprise_has_graphql_on_its_own_host() {
+        let canned = Canned::new(|_, _, _| body(r#"{"data":{"resource":null}}"#));
+        let _ = github_preview("u1", &Gh::api(&canned, Some("ghe.acme.dev")));
+        assert!(canned.calls()[0].starts_with("POST https://ghe.acme.dev/api/graphql "));
+    }
+
+    #[test]
+    fn github_rest_pages_follow_the_link_header() {
+        let canned = Canned::new(|_, path, _| match path {
+            "/repos/acme/r/teams?per_page=100" => Some(Reply {
+                body: r#"[{"slug":"web"}]"#.into(),
+                next: Some("https://api.github.com/repositories/1/teams?page=2".into()),
+            }),
+            "https://api.github.com/repositories/1/teams?page=2" => body(r#"[{"slug":"api"}]"#),
+            _ => None,
+        });
+        let out = Gh::api(&canned, None).pages("repos/acme/r/teams").unwrap();
+        assert_eq!(
+            github_teams(&out, "acme").unwrap(),
+            ["acme/web", "acme/api"]
+        );
+    }
+
+    #[test]
+    fn review_requests_through_the_api_send_json() {
+        let canned = Canned::new(|_, _, _| body("{}"));
+        let change = review::Change {
+            add: vec!["bao".into()],
+            remove: vec!["acme/web".into()],
+        };
+        let gh = Gh::api(&canned, None);
+        for call in github_review_calls("acme/r", 7, &change) {
+            gh.review(&call).unwrap();
+        }
+        let endpoint = "/repos/acme/r/pulls/7/requested_reviewers";
+        assert_eq!(
+            canned.calls(),
+            [
+                format!(r#"POST {endpoint} {{"reviewers":["bao"],"team_reviewers":[]}}"#),
+                format!(r#"DELETE {endpoint} {{"reviewers":[],"team_reviewers":["web"]}}"#),
+            ]
+        );
+    }
+
+    /// A Forgejo with two PRs in acme/app: 1 by bao, which asks me for a review, and 2 by me,
+    /// a draft from a fork, on the search's second page.
+    fn forgejo_answer(method: &str, path: &str, _: Option<&Value>) -> Option<Reply> {
+        assert_eq!(method, "GET");
+        let issue = |number: u64, title: &str, author: &str| {
+            format!(
+                r#"{{"number":{number},"title":"{title}","html_url":"https://git.example.com/acme/app/pulls/{number}","user":{{"login":"{author}"}},"updated_at":"2026-11-04T09:07:15Z","repository":{{"full_name":"acme/app","owner":"acme","name":"app"}},"comments":1}}"#
+            )
+        };
+        let search = "/repos/issues/search?type=pulls&state=open&limit=50&owner=acme";
+        match path {
+            "/user" => body(r#"{"login":"me"}"#),
+            _ if path == search => Some(Reply {
+                body: format!("[{}]", issue(1, "Add a cache", "bao")),
+                next: Some(format!("{search}&page=2")),
+            }),
+            _ if path == format!("{search}&page=2") => {
+                body(&format!("[{}]", issue(2, "WIP: try a thing", "me")))
+            }
+            "/repos/acme/app/pulls/1" => body(
+                r#"{"body":"It caches.","user":{"login":"bao"},"mergeable":false,"comments":3,"additions":10,"deletions":2,"changed_files":2,
+                    "base":{"ref":"main","sha":"b0","repo_id":1},"head":{"ref":"cache","sha":"s1","repo_id":1}}"#,
+            ),
+            "/repos/acme/app/pulls/2" => body(
+                r#"{"mergeable":false,"base":{"ref":"main","sha":"b0","repo_id":1},"head":{"ref":"main","sha":"s2","repo_id":9}}"#,
+            ),
+            "/repos/acme/app/pulls/1/reviews?limit=50" => body(
+                r#"[{"id":1,"user":{"login":"me"},"state":"REQUEST_REVIEW","body":"","submitted_at":"2026-11-04T09:00:00Z"},
+                    {"id":2,"user":{"login":"chidi"},"state":"APPROVED","body":"Good","submitted_at":"2026-11-04T10:00:00Z"},
+                    {"id":3,"user":null,"team":{"name":"web"},"state":"REQUEST_REVIEW","body":""}]"#,
+            ),
+            "/repos/acme/app/pulls/2/reviews?limit=50" => body("[]"),
+            "/repos/acme/app/commits/s1/status" => body(
+                r#"{"state":"warning","total_count":2,"statuses":[{"context":"build","status":"warning"},{"context":"lint","status":"skipped"}]}"#,
+            ),
+            "/repos/acme/app/commits/s2/status" => {
+                body(r#"{"state":"","total_count":0,"statuses":null}"#)
+            }
+            "/repos/acme/app/issues/1/comments" => body(
+                r#"[{"user":{"login":"dana"},"body":"Why?","created_at":"2026-11-04T09:30:00Z"}]"#,
+            ),
+            "/repos/acme/app/pulls/1/files?limit=50" => body(
+                r#"[{"filename":"src/cache.rs","additions":9,"deletions":0},{"filename":"README.md","additions":1,"deletions":2}]"#,
+            ),
+            "/repos/acme/app/reviewers" => {
+                body(r#"[{"login":"bao"},{"login":"chidi"},{"login":"dana"}]"#)
+            }
+            "/repos/acme/app/teams" => body(r#"[{"name":"web"},{"name":"ops"}]"#),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn forgejo_through_the_api_reads_the_prs_with_their_reviews_and_ci() {
+        let canned = Canned::new(forgejo_answer);
+        let prs = forgejo_api("Forgejo", &canned, Some("acme")).unwrap();
+        let got: Vec<_> = prs
+            .iter()
+            .map(|p| (p.number, p.status, p.ci, p.mine, p.requested))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (1, Status::Approved, Some(Ci::Failing), false, true),
+                (2, Status::Needs, None, true, false),
+            ]
+        );
+        let notes: Vec<_> = prs
+            .iter()
+            .map(|p| (p.draft, p.conflict, p.comments, p.head.as_str()))
+            .collect();
+        // 2 is a draft, so mergeable false is no conflict, and its head is in a fork
+        assert_eq!(notes, [(false, true, 3, "cache"), (true, false, 0, "")]);
+        assert_eq!(
+            prs[0].checks_url,
+            "https://git.example.com/acme/app/actions"
+        );
+    }
+
+    #[test]
+    fn forgejo_preview_through_the_api_has_files_checks_and_comments() {
+        let canned = Canned::new(forgejo_answer);
+        let preview = forgejo_api_preview(&canned, "acme/app", 1).unwrap();
+        assert_eq!(preview.body, "It caches.");
+        let files = preview.files.unwrap();
+        assert_eq!((files.count, files.additions, files.deletions), (2, 10, 2));
+        let paths: Vec<_> = files.changed.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["src/cache.rs", "README.md"]);
+        let checks: Vec<_> = preview
+            .checks
+            .iter()
+            .map(|c| (c.name.as_str(), c.state))
+            .collect();
+        assert_eq!(checks, [("build", Ci::Failing), ("lint", Ci::Passed)]);
+        let comments: Vec<_> = preview
+            .comments
+            .iter()
+            .map(|c| (c.author.as_str(), c.verdict))
+            .collect();
+        assert_eq!(comments, [("dana", None), ("chidi", Some("approved"))]);
+    }
+
+    #[test]
+    fn forgejo_reviewers_through_the_api_have_people_and_teams() {
+        let canned = Canned::new(forgejo_answer);
+        let pr = crate::pr::tests::pr("Forgejo", "app", 1, "bao", Status::Needs);
+        let reviewers = forgejo_api_reviewers(&canned, &pr).unwrap();
+        assert_eq!(reviewers.requested, ["acme/web", "me"]);
+        assert_eq!(reviewers.people, ["chidi", "dana", "acme/web", "acme/ops"]);
+        assert_eq!(reviewers.verdicts.get("chidi"), Some(&"approved"));
+    }
+
+    #[test]
+    fn gh_and_tea_dont_get_the_variables_that_hold_tokens() {
+        // cargo sets CARGO_PKG_NAME for the tests, so it stands for a token's variable
+        let source = Source::github("org:acme", None, None).with_token(crate::config::Token {
+            command: None,
+            env: Some("CARGO_PKG_NAME".into()),
+        });
+        token::note_vars([&source]);
+        let out = run(&["env"]).unwrap();
+        assert!(!out.contains("CARGO_PKG_NAME="), "{out}");
+        assert!(out.contains("PATH="));
     }
 }
