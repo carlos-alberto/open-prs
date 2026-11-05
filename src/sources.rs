@@ -275,7 +275,7 @@ impl<'a> Gh<'a> {
             {
                 // What GitHub leaves out for a fine-grained token, it says in errors, and the
                 // rest of the reply still holds
-                let fatal: Vec<&Value> = errors.iter().filter(|e| !left_out(e)).collect();
+                let fatal: Vec<&Value> = errors.iter().filter(|e| left_out(e).is_none()).collect();
                 if page.get("data").is_none_or(Value::is_null) || !fatal.is_empty() {
                     let shown = if fatal.is_empty() {
                         errors.iter().collect()
@@ -327,24 +327,39 @@ impl<'a> Gh<'a> {
     }
 }
 
-/// A part of the reply that GitHub left out, as the token may not read it: a PR's CI, as a
-/// fine-grained token can't read check runs, or a whole PR in a repo the token can't see.
-/// What SAML SSO keeps out is not left out: the user can authorize the token.
-fn left_out(error: &Value) -> bool {
+/// A part of the reply that GitHub left out, as the token may not read it.
+#[derive(Debug, PartialEq)]
+enum LeftOut {
+    /// A PR's commits, or their checks. A fine-grained token can't read check runs, and
+    /// without Contents: Read, GraphQL doesn't give it a PR's commits either.
+    Ci,
+    /// A whole PR, in a repo the token can't see
+    Pr,
+}
+
+/// What `error` says GitHub left out, if the rest of the reply still holds. What SAML SSO
+/// keeps out is not left out: the user can authorize the token.
+fn left_out(error: &Value) -> Option<LeftOut> {
     if error.get("type").and_then(Value::as_str) != Some("FORBIDDEN")
         || error["extensions"]["saml_failure"] == true
     {
-        return false;
+        return None;
     }
     let path: Vec<&Value> = error
         .get("path")
         .and_then(Value::as_array)
         .map(|p| p.iter().collect())
         .unwrap_or_default();
-    let ci = path.iter().any(|p| p.as_str() == Some("statusCheckRollup"));
-    let pr = matches!(path.as_slice(), [search, nodes, n]
-        if search.as_str() == Some("search") && nodes.as_str() == Some("nodes") && n.is_u64());
-    ci || pr
+    let named = |name: &str| path.iter().any(|p| p.as_str() == Some(name));
+    if named("commits") || named("statusCheckRollup") {
+        Some(LeftOut::Ci)
+    } else if matches!(path.as_slice(), [search, nodes, n]
+        if search.as_str() == Some("search") && nodes.as_str() == Some("nodes") && n.is_u64())
+    {
+        Some(LeftOut::Pr)
+    } else {
+        None
+    }
 }
 
 /// Whether GitHub left out the CI of the PRs in `out`, the replies to GraphQL.
@@ -358,7 +373,7 @@ fn ci_left_out(out: &str) -> bool {
                 .cloned()
                 .unwrap_or_default()
         })
-        .any(|e| left_out(&e) && e.to_string().contains("\"statusCheckRollup\""))
+        .any(|e| left_out(&e) == Some(LeftOut::Ci))
 }
 
 /// Each message of GraphQL's errors once, with how many times it came, and where it came first.
@@ -518,7 +533,8 @@ struct GhThread {
 
 #[derive(Deserialize)]
 struct GhCommits {
-    nodes: Vec<GhCommitNode>,
+    /// null when the token may not read it
+    nodes: Vec<Option<GhCommitNode>>,
 }
 
 #[derive(Deserialize)]
@@ -754,6 +770,7 @@ fn parse_github(name: &str, out: &str) -> Result<Vec<Pr>> {
                 .commits
                 .nodes
                 .into_iter()
+                .flatten()
                 .next()
                 .and_then(|c| c.commit.status_check_rollup);
             prs.push(Pr {
@@ -796,11 +813,11 @@ fn parse_github(name: &str, out: &str) -> Result<Vec<Pr>> {
 const GITHUB_PREVIEW_QUERY: &str = "
 query($url: URI!) {
   resource(url: $url) { ... on PullRequest {
-    body additions deletions changedFiles
+    body additions deletions changedFiles headRefOid
     files(first: 100) { nodes { path additions deletions } }
     comments(last: 10) { nodes { author { login } body createdAt } }
     reviews(last: 10) { nodes { author { login } state body submittedAt } }
-    commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: 100) { nodes {
+    commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {
       __typename
       ... on CheckRun { name status conclusion }
       ... on StatusContext { context state }
@@ -829,7 +846,8 @@ struct GhPreview {
     files: Option<GhNodes<GhFile>>,
     comments: GhNodes<GhComment>,
     reviews: GhNodes<GhReview>,
-    commits: GhNodes<GhContextCommitNode>,
+    /// A node is null when the token may not read it
+    commits: GhNodes<Option<GhContextCommitNode>>,
 }
 
 #[derive(Deserialize)]
@@ -900,8 +918,9 @@ fn github_preview(pr: &Pr, via: &Gh) -> Result<Preview> {
     if let Gh::Api { http, .. } = via
         && ci_left_out(&out)
         && let Some(sha) = serde_json::from_str::<Value>(&out).ok().and_then(|page| {
-            let commit = &page["data"]["resource"]["commits"]["nodes"][0]["commit"];
-            commit["oid"].as_str().map(str::to_owned)
+            page["data"]["resource"]["headRefOid"]
+                .as_str()
+                .map(str::to_owned)
         })
     {
         preview.checks = rest_checks(*http, &pr.repo, &sha);
@@ -945,6 +964,7 @@ fn parse_github_preview(out: &str) -> Result<Preview> {
         .commits
         .nodes
         .into_iter()
+        .flatten()
         .next()
         .and_then(|c| c.commit.status_check_rollup)
         .map_or_else(Vec::new, |r| r.contexts.nodes);
@@ -2546,7 +2566,7 @@ mod tests {
     }
 
     /// A reply to the search for the PRs, as GitHub gives it to a fine-grained token: the
-    /// first PR without its CI, the second PR not there, and the third PR.
+    /// first PR without its commit, the second PR not there, and the third PR without its CI.
     fn search_without_ci(_: &str, path: &str, sent: Option<&Value>) -> Option<Reply> {
         let refused = |path: &str| {
             format!(
@@ -2555,11 +2575,15 @@ mod tests {
         };
         match path {
             "/graphql" if sent?["variables"]["q"] == "is:pr is:open org:acme" => body(&format!(
-                r#"{{"data":{{"viewer":{{"login":"me"}},"search":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[{},null,{}]}}}},"errors":[{},{}]}}"#,
-                gh_node(1),
-                gh_node(3),
-                refused(r#"["search","nodes",0,"commits","nodes",0,"commit","statusCheckRollup"]"#),
+                r#"{{"data":{{"viewer":{{"login":"me"}},"search":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[{},null,{}]}}}},"errors":[{},{},{}]}}"#,
+                gh_node(1).replace(r#""commits":{"nodes":[]}"#, r#""commits":{"nodes":[null]}"#),
+                gh_node(3).replace(
+                    r#""commits":{"nodes":[]}"#,
+                    r#""commits":{"nodes":[{"commit":{"statusCheckRollup":null}}]}"#
+                ),
+                refused(r#"["search","nodes",0,"commits","nodes",0]"#),
                 refused(r#"["search","nodes",1]"#),
+                refused(r#"["search","nodes",2,"commits","nodes",0,"commit","statusCheckRollup"]"#),
             )),
             "/graphql" => body(
                 r#"{"data":{"search":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}"#,
@@ -2631,10 +2655,10 @@ mod tests {
         let canned = Canned::new(|_, path, _| match path {
             "/graphql" => body(
                 r#"{"data":{"resource":{"body":"","additions":0,"deletions":0,"changedFiles":0,
-                    "files":{"nodes":[]},"comments":{"nodes":[]},"reviews":{"nodes":[]},
-                    "commits":{"nodes":[{"commit":{"oid":"sha1","statusCheckRollup":null}}]}}},
+                    "headRefOid":"sha1","files":{"nodes":[]},"comments":{"nodes":[]},
+                    "reviews":{"nodes":[]},"commits":{"nodes":[null]}}},
                   "errors":[{"type":"FORBIDDEN","message":"Resource not accessible by personal access token",
-                    "path":["resource","commits","nodes",0,"commit","statusCheckRollup"]}]}"#,
+                    "path":["resource","commits","nodes",0]}]}"#,
             ),
             "/repos/acme/r/commits/sha1/status" => {
                 body(r#"{"statuses":[{"context":"lint","state":"error"}]}"#)
