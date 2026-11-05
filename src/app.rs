@@ -901,10 +901,10 @@ impl App {
             KeyCode::End => view.scroll = view.max_scroll,
             // These act on the PR in the preview, which can be gone from the table, as with u
             KeyCode::Enter | KeyCode::Char('o') => {
-                self.open_url(view.pr.url.clone());
+                self.open_url(&view.pr.url, &view.pr.url);
                 self.see_pr(&view.pr, false);
             }
-            KeyCode::Char('c') => self.open_url(view.pr.checks_url.clone()),
+            KeyCode::Char('c') => self.open_url(&view.pr.checks_url, &view.pr.url),
             KeyCode::Char('y') => self.copy(view.pr.url.clone()),
             // The next or previous PR in the table
             KeyCode::Right | KeyCode::Left => {
@@ -1081,19 +1081,29 @@ impl App {
 
     /// Opens a page of the PR under the cursor in the browser.
     fn open(&mut self, page: fn(&Pr) -> &String) {
-        if let Some(url) = self.selected().map(|p| page(p).clone()) {
-            self.open_url(url);
+        if let Some(p) = self.selected().cloned() {
+            self.open_url(page(&p), &p.url);
         }
     }
 
-    fn open_url(&mut self, url: String) {
+    /// Opens `url`, a page of the PR at `pr_url`, in the browser, if `safe_url` allows it.
+    fn open_url(&mut self, url: &str, pr_url: &str) {
+        if let Err(why) = safe_url(url, pr_url) {
+            self.notify(
+                format!("Did not open {}", clean(url)),
+                why,
+                true,
+                ERROR_TIMEOUT,
+            );
+            return;
+        }
         let opener = if cfg!(target_os = "macos") {
             "open"
         } else {
             "xdg-open"
         };
         let child = Command::new(opener)
-            .arg(&url)
+            .arg(url)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1551,6 +1561,55 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ),
         rect,
     );
+}
+
+/// Says why the browser must not open `url`, a page of the PR at `pr_url`. Only web pages on the
+/// PR's own host open: https, or http when the PR's URL is http too, as a local Gitea's can be.
+/// Any other link, such as `file:`, `javascript:` or an app's link, could start a program.
+fn safe_url(url: &str, pr_url: &str) -> Result<(), String> {
+    let (scheme, host) = web_parts(url, "It")?;
+    let (pr_scheme, pr_host) = web_parts(pr_url, "The PR's URL")?;
+    if scheme == "http" && pr_scheme != "http" {
+        return Err("It uses http, but the PR uses https".into());
+    }
+    if host != pr_host {
+        return Err(format!("It is on {host}, not on the PR's host {pr_host}"));
+    }
+    Ok(())
+}
+
+/// The scheme and the host of a web link, with any port, in lower case. `what` names the link
+/// in the error.
+fn web_parts(url: &str, what: &str) -> Result<(String, String), String> {
+    // A browser reads these in ways that can hide the real host
+    if url
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+    {
+        return Err(format!(
+            "{what} has a space, a control character or a backslash"
+        ));
+    }
+    let Some((scheme, rest)) = url.split_once(':') else {
+        return Err(format!("{what} has no scheme, such as https:"));
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "https" && scheme != "http" {
+        return Err(format!(
+            "{what} is a {scheme}: link, and only https and http links open"
+        ));
+    }
+    let host = rest
+        .strip_prefix("//")
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        .unwrap_or_default();
+    if host.is_empty() {
+        return Err(format!("{what} has no host"));
+    }
+    if host.contains('@') {
+        return Err(format!("{what} has a user name before its host"));
+    }
+    Ok((scheme, host.to_ascii_lowercase()))
 }
 
 /// `path` with the home folder as `~`.
@@ -2097,6 +2156,83 @@ mod tests {
         ] {
             assert_eq!(base64(plain.as_bytes()), encoded);
         }
+    }
+
+    #[test]
+    fn only_web_pages_on_the_prs_host_open() {
+        let pr_url = "https://git.example.com/acme/app/pulls/1";
+        let check = |url| safe_url(url, pr_url);
+        assert_eq!(check(pr_url), Ok(()));
+        assert_eq!(check("HTTPS://Git.Example.com/acme/app/pulls/1"), Ok(()));
+        let only_web =
+            |scheme| format!("It is a {scheme}: link, and only https and http links open");
+        for (url, why) in [
+            ("file:///etc/passwd", only_web("file")),
+            ("javascript:alert(1)", only_web("javascript")),
+            ("vscode://file/etc/passwd", only_web("vscode")),
+            (
+                "https://ci.example.org/acme/app",
+                "It is on ci.example.org, not on the PR's host git.example.com".into(),
+            ),
+            (
+                "http://git.example.com/acme/app/pulls/1",
+                "It uses http, but the PR uses https".into(),
+            ),
+            (
+                "https://git.example.com@ci.example.org/",
+                "It has a user name before its host".into(),
+            ),
+            // A browser reads the backslash as a slash, so the host is ci.example.org
+            (
+                "https://ci.example.org\\@git.example.com/",
+                "It has a space, a control character or a backslash".into(),
+            ),
+            ("https:git.example.com/acme", "It has no host".into()),
+            (
+                "git.example.com/acme",
+                "It has no scheme, such as https:".into(),
+            ),
+        ] {
+            assert_eq!(check(url), Err(why), "{url}");
+        }
+
+        // A local Gitea can use http, but only on its own host and port
+        let local = "http://localhost:3000/acme/app/pulls/1";
+        assert_eq!(safe_url(local, local), Ok(()));
+        assert_eq!(
+            safe_url("http://localhost:3000/acme/app/actions", local),
+            Ok(())
+        );
+        assert!(safe_url("http://localhost:8080/", local).is_err());
+        // The PR's own URL must be a web page too
+        assert_eq!(
+            safe_url("https://git.example.com/", "file:///etc/passwd"),
+            Err("The PR's URL is a file: link, and only https and http links open".into())
+        );
+    }
+
+    #[test]
+    fn o_and_c_show_why_they_do_not_open_an_unsafe_link() {
+        let (mut app, _rx) = app(Group::Repo, vec![github()]);
+        let mut p = pr("GitHub", "a", 1, "x", Status::Needs);
+        p.checks_url = "https://ci.example.org/acme/a".into();
+        app.loaded(0, Ok(vec![p]));
+        app.on_key(key(KeyCode::Char('c')));
+        assert_eq!(
+            app.toasts[0].title,
+            "Did not open https://ci.example.org/acme/a"
+        );
+        assert_eq!(
+            app.toasts[0].message,
+            "It is on ci.example.org, not on the PR's host github.example.com"
+        );
+
+        let mut p = pr("GitHub", "a", 2, "x", Status::Needs);
+        p.url = "vscode://file/etc/passwd".into();
+        app.loaded(0, Ok(vec![p]));
+        app.on_key(key(KeyCode::Char('o')));
+        assert_eq!(app.toasts[1].title, "Did not open vscode://file/etc/passwd");
+        assert!(app.toasts[1].error);
     }
 
     #[test]
