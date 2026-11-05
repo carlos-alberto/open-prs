@@ -1,8 +1,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -46,10 +47,10 @@ pub fn preview(source: &Source, pr: &Pr) -> Result<Preview> {
             hostname,
             token: None,
             ..
-        } => github_preview(&pr.url, &Gh::Cli(hostname.as_deref())),
+        } => github_preview(pr, &Gh::Cli(hostname.as_deref())),
         Kind::GitHub { hostname, .. } => {
             let http = api(source)?;
-            github_preview(&pr.url, &Gh::api(&http, hostname.as_deref()))
+            github_preview(pr, &Gh::api(&http, hostname.as_deref()))
         }
         Kind::Forgejo {
             login: Login::Tea(login),
@@ -272,11 +273,17 @@ impl<'a> Gh<'a> {
             if let Some(errors) = page.get("errors").and_then(Value::as_array)
                 && !errors.is_empty()
             {
-                let messages: Vec<&str> = errors
-                    .iter()
-                    .filter_map(|e| e.get("message")?.as_str())
-                    .collect();
-                bail!("GitHub: {}", messages.join("; "));
+                // What GitHub leaves out for a fine-grained token, it says in errors, and the
+                // rest of the reply still holds
+                let fatal: Vec<&Value> = errors.iter().filter(|e| !left_out(e)).collect();
+                if page.get("data").is_none_or(Value::is_null) || !fatal.is_empty() {
+                    let shown = if fatal.is_empty() {
+                        errors.iter().collect()
+                    } else {
+                        fatal
+                    };
+                    bail!("GitHub: {}", graphql_errors(&shown));
+                }
             }
             out.push_str(&reply);
             out.push('\n');
@@ -320,6 +327,78 @@ impl<'a> Gh<'a> {
     }
 }
 
+/// A part of the reply that GitHub left out, as the token may not read it: a PR's CI, as a
+/// fine-grained token can't read check runs, or a whole PR in a repo the token can't see.
+/// What SAML SSO keeps out is not left out: the user can authorize the token.
+fn left_out(error: &Value) -> bool {
+    if error.get("type").and_then(Value::as_str) != Some("FORBIDDEN")
+        || error["extensions"]["saml_failure"] == true
+    {
+        return false;
+    }
+    let path: Vec<&Value> = error
+        .get("path")
+        .and_then(Value::as_array)
+        .map(|p| p.iter().collect())
+        .unwrap_or_default();
+    let ci = path.iter().any(|p| p.as_str() == Some("statusCheckRollup"));
+    let pr = matches!(path.as_slice(), [search, nodes, n]
+        if search.as_str() == Some("search") && nodes.as_str() == Some("nodes") && n.is_u64());
+    ci || pr
+}
+
+/// Whether GitHub left out the CI of the PRs in `out`, the replies to GraphQL.
+fn ci_left_out(out: &str) -> bool {
+    serde_json::Deserializer::from_str(out)
+        .into_iter::<Value>()
+        .filter_map(Result::ok)
+        .flat_map(|page| {
+            page.get("errors")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .any(|e| left_out(&e) && e.to_string().contains("\"statusCheckRollup\""))
+}
+
+/// Each message of GraphQL's errors once, with how many times it came, and where it came first.
+fn graphql_errors(errors: &[&Value]) -> String {
+    let mut seen: Vec<(String, usize, String)> = Vec::new();
+    for error in errors {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("an error with no message")
+            .to_owned();
+        let path = error
+            .get("path")
+            .and_then(Value::as_array)
+            .map(|path| {
+                path.iter()
+                    .map(|part| match part {
+                        Value::String(name) => name.clone(),
+                        other => other.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+            .unwrap_or_default();
+        match seen.iter_mut().find(|(m, ..)| *m == message) {
+            Some((_, count, _)) => *count += 1,
+            None => seen.push((message, 1, path)),
+        }
+    }
+    seen.into_iter()
+        .map(|(message, count, path)| match (count, path.is_empty()) {
+            (1, true) => message,
+            (1, false) => format!("{message} (at {path})"),
+            (count, true) => format!("{message} ({count} times)"),
+            (count, false) => format!("{message} ({count} times, first at {path})"),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// The cursor of the next page, from the first pageInfo in the reply that has one.
 fn page_info(value: &Value) -> Option<String> {
     match value {
@@ -344,7 +423,7 @@ query($q: String!, $endCursor: String) {
   search(query: $q, type: ISSUE, first: 50, after: $endCursor) {
     pageInfo { hasNextPage endCursor }
     nodes { ... on PullRequest {
-      number title url reviewDecision updatedAt isDraft mergeable baseRefName headRefName
+      number title url reviewDecision updatedAt isDraft mergeable baseRefName headRefName headRefOid
       author { login }
       repository { nameWithOwner }
       headRepository { nameWithOwner }
@@ -483,11 +562,149 @@ fn github(name: &str, query: &str, via: &Gh) -> Result<Vec<Pr>> {
         (gh(query, GITHUB_QUERY), requested.join().unwrap())
     });
     let requested = parse_urls(&requested?)?;
-    let mut prs = parse_github(name, &prs?)?;
+    let out = prs?;
+    let mut prs = parse_github(name, &out)?;
     for p in &mut prs {
         p.requested = requested.contains(&p.url);
     }
+    // GitHub leaves out the CI for a fine-grained token, which can't read check runs; the
+    // commit statuses and the Actions runs say most of it
+    if let Gh::Api { http, .. } = via
+        && ci_left_out(&out)
+    {
+        let shas = github_shas(&out);
+        let found = par_map(&prs, 8, |p| {
+            let sha = shas.get(&p.url)?;
+            rollup(&kept_checks(name, *http, &p.repo, sha))
+        });
+        for (p, ci) in prs.iter_mut().zip(found) {
+            if p.ci.is_none() {
+                p.ci = ci;
+            }
+        }
+    }
     Ok(prs)
+}
+
+/// The commit at the head of each PR in `out`, by the PR's URL.
+fn github_shas(out: &str) -> HashMap<String, String> {
+    let mut shas = HashMap::new();
+    for page in serde_json::Deserializer::from_str(out).into_iter::<Value>() {
+        let Ok(page) = page else { continue };
+        let nodes = page["data"]["search"]["nodes"].as_array().cloned();
+        for node in nodes.unwrap_or_default() {
+            if let (Some(url), Some(sha)) = (node["url"].as_str(), node["headRefOid"].as_str()) {
+                shas.insert(url.to_owned(), sha.to_owned());
+            }
+        }
+    }
+    shas
+}
+
+#[derive(Deserialize)]
+struct GhCombined {
+    #[serde(default)]
+    statuses: Vec<GhStatus>,
+}
+
+#[derive(Deserialize)]
+struct GhStatus {
+    context: String,
+    state: String,
+}
+
+#[derive(Deserialize)]
+struct GhRuns {
+    #[serde(default)]
+    workflow_runs: Vec<GhRun>,
+}
+
+#[derive(Deserialize)]
+struct GhRun {
+    name: Option<String>,
+    event: Option<String>,
+    status: Option<String>,
+    conclusion: Option<String>,
+}
+
+/// How long the checks of a commit stay kept once they are all done; only a new run of
+/// one changes them. All of a user's tokens share 5000 REST calls an hour.
+const KEEP_CHECKS: Duration = Duration::from_secs(10 * 60);
+
+/// The checks found over REST, by source, repo and commit, with when they were found.
+type KeptChecks = HashMap<(String, String, String), (Instant, Vec<Check>)>;
+
+static CHECKS: LazyLock<Mutex<KeptChecks>> = LazyLock::new(Mutex::default);
+
+/// The checks on `sha`, from those kept when they are all done and recent.
+fn kept_checks(source: &str, http: &dyn Http, repo: &str, sha: &str) -> Vec<Check> {
+    let key = (source.to_owned(), repo.to_owned(), sha.to_owned());
+    if let Some((at, checks)) = CHECKS.lock().unwrap().get(&key)
+        && at.elapsed() < KEEP_CHECKS
+    {
+        return checks.clone();
+    }
+    let checks = rest_checks(http, repo, sha);
+    let mut kept = CHECKS.lock().unwrap();
+    kept.retain(|_, (at, _)| at.elapsed() < KEEP_CHECKS);
+    // CI that has not started yet shows as no checks, so only checks that are done stay
+    if !checks.is_empty() && checks.iter().all(|c| c.state != Ci::Pending) {
+        kept.insert(key, (Instant::now(), checks.clone()));
+    }
+    checks
+}
+
+/// The checks on `sha` that a fine-grained token can read through REST: the commit statuses,
+/// and the runs of GitHub Actions. A token without the permission for one still gets the other.
+fn rest_checks(http: &dyn Http, repo: &str, sha: &str) -> Vec<Check> {
+    let (statuses, runs) = thread::scope(|s| {
+        let runs = s.spawn(|| {
+            let path = format!("/repos/{repo}/actions/runs?head_sha={sha}&per_page=100");
+            get_json::<GhRuns>(http, &path)
+        });
+        let statuses = get_json::<GhCombined>(http, &format!("/repos/{repo}/commits/{sha}/status"));
+        (statuses, runs.join().unwrap())
+    });
+    let mut checks: Vec<Check> = statuses
+        .map(|s| s.statuses)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| Check {
+            name: s.context,
+            state: github_ci(&s.state.to_ascii_uppercase()).unwrap_or(Ci::Pending),
+        })
+        .collect();
+    // The newest run comes first; an older run of the same workflow, for the same event, is
+    // one that a new run replaced
+    let mut seen = HashSet::new();
+    checks.extend(
+        runs.map(|r| r.workflow_runs)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| seen.insert((r.name.clone(), r.event.clone())))
+            .map(|r| Check {
+                name: r.name.unwrap_or_else(|| "a workflow".into()),
+                state: match (r.status.as_deref(), r.conclusion.as_deref()) {
+                    (Some("completed"), Some("success" | "neutral" | "skipped")) => Ci::Passed,
+                    (Some("completed"), _) => Ci::Failing,
+                    _ => Ci::Pending,
+                },
+            }),
+    );
+    checks
+}
+
+/// The state of `checks` together, as GitHub's rollup gives it: any failing check fails.
+fn rollup(checks: &[Check]) -> Option<Ci> {
+    if checks.iter().any(|c| c.state == Ci::Failing) {
+        Some(Ci::Failing)
+    } else if checks.iter().any(|c| c.state == Ci::Pending) {
+        Some(Ci::Pending)
+    } else if checks.is_empty() {
+        None
+    } else {
+        Some(Ci::Passed)
+    }
 }
 
 fn parse_urls(out: &str) -> Result<HashSet<String>> {
@@ -583,7 +800,7 @@ query($url: URI!) {
     files(first: 100) { nodes { path additions deletions } }
     comments(last: 10) { nodes { author { login } body createdAt } }
     reviews(last: 10) { nodes { author { login } state body submittedAt } }
-    commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {
+    commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: 100) { nodes {
       __typename
       ... on CheckRun { name status conclusion }
       ... on StatusContext { context state }
@@ -676,8 +893,20 @@ enum GhContext {
     },
 }
 
-fn github_preview(url: &str, via: &Gh) -> Result<Preview> {
-    parse_github_preview(&via.graphql(GITHUB_PREVIEW_QUERY, &[("url", url)], false)?)
+fn github_preview(pr: &Pr, via: &Gh) -> Result<Preview> {
+    let out = via.graphql(GITHUB_PREVIEW_QUERY, &[("url", &pr.url)], false)?;
+    let mut preview = parse_github_preview(&out)?;
+    // As for the list, the checks of a fine-grained token come from REST
+    if let Gh::Api { http, .. } = via
+        && ci_left_out(&out)
+        && let Some(sha) = serde_json::from_str::<Value>(&out).ok().and_then(|page| {
+            let commit = &page["data"]["resource"]["commits"]["nodes"][0]["commit"];
+            commit["oid"].as_str().map(str::to_owned)
+        })
+    {
+        preview.checks = rest_checks(*http, &pr.repo, &sha);
+    }
+    Ok(preview)
 }
 
 fn parse_github_preview(out: &str) -> Result<Preview> {
@@ -1770,6 +1999,11 @@ mod tests {
     use super::*;
     use crate::http::Reply;
 
+    /// A PR on GitHub in acme/r, as the tests of the preview need one.
+    fn gh_pr() -> Pr {
+        crate::pr::tests::pr("GitHub", "r", 1, "me", Status::Needs)
+    }
+
     fn review(id: i64, reviewer: &str, state: &str) -> TeaReview {
         TeaReview {
             id,
@@ -2250,7 +2484,7 @@ mod tests {
     /// A PR in GitHub's search, with only what parse_github needs.
     fn gh_node(number: u64) -> String {
         format!(
-            r#"{{"number":{number},"title":"t","url":"u{number}","reviewDecision":null,"updatedAt":"2026-11-04T09:07:15Z","isDraft":false,"mergeable":"MERGEABLE","baseRefName":"main","headRefName":"b{number}","author":{{"login":"me"}},"repository":{{"nameWithOwner":"acme/r"}},"headRepository":{{"nameWithOwner":"acme/r"}},"latestOpinionatedReviews":{{"nodes":[]}},"commits":{{"nodes":[]}},"comments":{{"totalCount":0}},"reviewThreads":{{"nodes":[]}}}}"#
+            r#"{{"number":{number},"title":"t","url":"u{number}","reviewDecision":null,"updatedAt":"2026-11-04T09:07:15Z","isDraft":false,"mergeable":"MERGEABLE","baseRefName":"main","headRefName":"b{number}","headRefOid":"sha{number}","author":{{"login":"me"}},"repository":{{"nameWithOwner":"acme/r"}},"headRepository":{{"nameWithOwner":"acme/r"}},"latestOpinionatedReviews":{{"nodes":[]}},"commits":{{"nodes":[]}},"comments":{{"totalCount":0}},"reviewThreads":{{"nodes":[]}}}}"#
         )
     }
 
@@ -2288,7 +2522,7 @@ mod tests {
                 r#"{"data":null,"errors":[{"message":"Resource not accessible by personal access token"}]}"#,
             )
         });
-        let error = github_preview("u1", &Gh::api(&canned, None)).unwrap_err();
+        let error = github_preview(&gh_pr(), &Gh::api(&canned, None)).unwrap_err();
         assert_eq!(
             format!("{error:#}"),
             "GitHub: Resource not accessible by personal access token"
@@ -2296,9 +2530,143 @@ mod tests {
     }
 
     #[test]
+    fn graphqls_errors_show_each_message_once_with_a_count_and_a_place() {
+        let canned = Canned::new(|_, _, _| {
+            let refused = r#"{"type":"FORBIDDEN","path":["resource","files"],"message":"Resource not accessible by personal access token"}"#;
+            body(&format!(
+                r#"{{"data":null,"errors":[{refused},{refused},{refused},{{"message":"Something else"}}]}}"#
+            ))
+        });
+        let error = github_preview(&gh_pr(), &Gh::api(&canned, None)).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "GitHub: Resource not accessible by personal access token (3 times, first at \
+             resource.files); Something else"
+        );
+    }
+
+    /// A reply to the search for the PRs, as GitHub gives it to a fine-grained token: the
+    /// first PR without its CI, the second PR not there, and the third PR.
+    fn search_without_ci(_: &str, path: &str, sent: Option<&Value>) -> Option<Reply> {
+        let refused = |path: &str| {
+            format!(
+                r#"{{"type":"FORBIDDEN","path":{path},"message":"Resource not accessible by personal access token"}}"#
+            )
+        };
+        match path {
+            "/graphql" if sent?["variables"]["q"] == "is:pr is:open org:acme" => body(&format!(
+                r#"{{"data":{{"viewer":{{"login":"me"}},"search":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[{},null,{}]}}}},"errors":[{},{}]}}"#,
+                gh_node(1),
+                gh_node(3),
+                refused(r#"["search","nodes",0,"commits","nodes",0,"commit","statusCheckRollup"]"#),
+                refused(r#"["search","nodes",1]"#),
+            )),
+            "/graphql" => body(
+                r#"{"data":{"search":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}"#,
+            ),
+            "/repos/acme/r/commits/sha1/status" => {
+                body(r#"{"state":"success","statuses":[{"context":"lint","state":"success"}]}"#)
+            }
+            "/repos/acme/r/actions/runs?head_sha=sha1&per_page=100" => body(
+                r#"{"workflow_runs":[{"name":"test","status":"completed","conclusion":"failure"}]}"#,
+            ),
+            "/repos/acme/r/commits/sha3/status" => {
+                body(r#"{"state":"pending","statuses":[{"context":"deploy","state":"pending"}]}"#)
+            }
+            // Without the Actions permission, GitHub doesn't show the runs
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_fine_grained_token_gets_the_prs_and_reads_their_ci_over_rest() {
+        let canned = Canned::new(search_without_ci);
+        let via = Gh::api(&canned, None);
+        let prs = github("Fine-grained", "org:acme", &via).unwrap();
+        let got: Vec<_> = prs.iter().map(|p| (p.number, p.ci)).collect();
+        assert_eq!(got, [(1, Some(Ci::Failing)), (3, Some(Ci::Pending))]);
+
+        // The next load keeps the checks that are done, and reads again those that are not
+        let before = canned.calls().len();
+        let prs = github("Fine-grained", "org:acme", &via).unwrap();
+        let got: Vec<_> = prs.iter().map(|p| (p.number, p.ci)).collect();
+        assert_eq!(got, [(1, Some(Ci::Failing)), (3, Some(Ci::Pending))]);
+        let again = canned.calls().split_off(before);
+        assert!(!again.iter().any(|c| c.contains("sha1")), "{again:?}");
+        assert!(again.iter().any(|c| c.contains("sha3")), "{again:?}");
+    }
+
+    #[test]
+    fn a_pr_that_saml_sso_keeps_out_fails() {
+        let canned = Canned::new(|_, _, _| {
+            body(&format!(
+                r#"{{"data":{{"viewer":{{"login":"me"}},"search":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[{},null]}}}},"errors":[{{"type":"FORBIDDEN","path":["search","nodes",1],"extensions":{{"saml_failure":true}},"message":"Resource protected by organization SAML enforcement"}}]}}"#,
+                gh_node(1)
+            ))
+        });
+        let error = github("GitHub", "org:acme", &Gh::api(&canned, None)).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "GitHub: Resource protected by organization SAML enforcement (at search.nodes.1)"
+        );
+    }
+
+    #[test]
+    fn a_refusal_of_another_field_still_fails() {
+        let canned = Canned::new(|_, _, _| {
+            body(&format!(
+                r#"{{"data":{{"viewer":{{"login":"me"}},"search":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[{}]}}}},"errors":[{{"type":"FORBIDDEN","path":["search","nodes",0,"author"],"message":"Resource not accessible by personal access token"}}]}}"#,
+                gh_node(1)
+            ))
+        });
+        let error = github("GitHub", "org:acme", &Gh::api(&canned, None)).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "GitHub: Resource not accessible by personal access token (at search.nodes.0.author)"
+        );
+    }
+
+    #[test]
+    fn the_preview_of_a_fine_grained_token_reads_the_checks_over_rest() {
+        let canned = Canned::new(|_, path, _| match path {
+            "/graphql" => body(
+                r#"{"data":{"resource":{"body":"","additions":0,"deletions":0,"changedFiles":0,
+                    "files":{"nodes":[]},"comments":{"nodes":[]},"reviews":{"nodes":[]},
+                    "commits":{"nodes":[{"commit":{"oid":"sha1","statusCheckRollup":null}}]}}},
+                  "errors":[{"type":"FORBIDDEN","message":"Resource not accessible by personal access token",
+                    "path":["resource","commits","nodes",0,"commit","statusCheckRollup"]}]}"#,
+            ),
+            "/repos/acme/r/commits/sha1/status" => {
+                body(r#"{"statuses":[{"context":"lint","state":"error"}]}"#)
+            }
+            "/repos/acme/r/actions/runs?head_sha=sha1&per_page=100" => body(
+                r#"{"workflow_runs":[
+                    {"name":"test","event":"pull_request","status":"completed","conclusion":"skipped"},
+                    {"name":"e2e","event":"pull_request","status":"queued","conclusion":null},
+                    {"name":"e2e","event":"pull_request","status":"completed","conclusion":"cancelled"}]}"#,
+            ),
+            _ => None,
+        });
+        let preview = github_preview(&gh_pr(), &Gh::api(&canned, None)).unwrap();
+        let checks: Vec<(&str, Ci)> = preview
+            .checks
+            .iter()
+            .map(|c| (c.name.as_str(), c.state))
+            .collect();
+        assert_eq!(
+            checks,
+            [
+                ("lint", Ci::Failing),
+                ("test", Ci::Passed),
+                ("e2e", Ci::Pending)
+            ]
+        );
+    }
+
+    #[test]
     fn github_enterprise_has_graphql_on_its_own_host() {
         let canned = Canned::new(|_, _, _| body(r#"{"data":{"resource":null}}"#));
-        let _ = github_preview("u1", &Gh::api(&canned, Some("ghe.acme.dev")));
+        let _ = github_preview(&gh_pr(), &Gh::api(&canned, Some("ghe.acme.dev")));
         assert!(canned.calls()[0].starts_with("POST https://ghe.acme.dev/api/graphql "));
     }
 
