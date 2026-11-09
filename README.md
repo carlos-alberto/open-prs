@@ -194,6 +194,8 @@ Each source is a GitHub search, or the PRs on a Forgejo or Gitea. They come from
    made with `s` save to this file, and keep its comments.
 3. Neither: one GitHub search for `involves:@me`, through gh's login, which is deprecated.
 
+GitHub sources exclude PRs in archived repositories.
+
 ```toml
 notify = true                  # desktop notifications; b sets it; default false
 writes = true                  # let v change the reviewers on the host; default false

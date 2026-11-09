@@ -568,7 +568,7 @@ struct GhState {
 
 fn github(name: &str, query: &str, via: &Gh) -> Result<Vec<Pr>> {
     let gh = |search: &str, graphql: &str| {
-        let search = format!("is:pr is:open {search}");
+        let search = format!("is:pr is:open archived:false {search}");
         via.graphql(graphql, &[("q", &search)], true)
     };
     // review-requested also finds requests to your teams, which the PR's own list of
@@ -2519,10 +2519,10 @@ mod tests {
                     r#"{{"data":{{"viewer":{{"login":"me"}},"search":{{"pageInfo":{{"hasNextPage":{more},"endCursor":{cursor}}},"nodes":[{nodes}]}}}}}}"#
                 )
             };
-            if variables["q"] == "is:pr is:open org:acme review-requested:@me" {
+            if variables["q"] == "is:pr is:open archived:false org:acme review-requested:@me" {
                 return body(&search(false, "null", r#"{"url":"u2"}"#));
             }
-            assert_eq!(variables["q"], "is:pr is:open org:acme");
+            assert_eq!(variables["q"], "is:pr is:open archived:false org:acme");
             match variables.get("endCursor").and_then(Value::as_str) {
                 None => body(&search(true, r#""c1""#, &gh_node(1))),
                 Some("c1") => body(&search(false, "null", &gh_node(2))),
@@ -2574,17 +2574,22 @@ mod tests {
             )
         };
         match path {
-            "/graphql" if sent?["variables"]["q"] == "is:pr is:open org:acme" => body(&format!(
-                r#"{{"data":{{"viewer":{{"login":"me"}},"search":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[{},null,{}]}}}},"errors":[{},{},{}]}}"#,
-                gh_node(1).replace(r#""commits":{"nodes":[]}"#, r#""commits":{"nodes":[null]}"#),
-                gh_node(3).replace(
-                    r#""commits":{"nodes":[]}"#,
-                    r#""commits":{"nodes":[{"commit":{"statusCheckRollup":null}}]}"#
-                ),
-                refused(r#"["search","nodes",0,"commits","nodes",0]"#),
-                refused(r#"["search","nodes",1]"#),
-                refused(r#"["search","nodes",2,"commits","nodes",0,"commit","statusCheckRollup"]"#),
-            )),
+            "/graphql" if sent?["variables"]["q"] == "is:pr is:open archived:false org:acme" => {
+                body(&format!(
+                    r#"{{"data":{{"viewer":{{"login":"me"}},"search":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[{},null,{}]}}}},"errors":[{},{},{}]}}"#,
+                    gh_node(1)
+                        .replace(r#""commits":{"nodes":[]}"#, r#""commits":{"nodes":[null]}"#),
+                    gh_node(3).replace(
+                        r#""commits":{"nodes":[]}"#,
+                        r#""commits":{"nodes":[{"commit":{"statusCheckRollup":null}}]}"#
+                    ),
+                    refused(r#"["search","nodes",0,"commits","nodes",0]"#),
+                    refused(r#"["search","nodes",1]"#),
+                    refused(
+                        r#"["search","nodes",2,"commits","nodes",0,"commit","statusCheckRollup"]"#
+                    ),
+                ))
+            }
             "/graphql" => body(
                 r#"{"data":{"search":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}"#,
             ),
