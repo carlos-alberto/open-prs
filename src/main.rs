@@ -100,6 +100,12 @@ struct Args {
     /// Don't change anything on the hosts, whatever the config file says
     #[arg(long, overrides_with = "writes")]
     no_writes: bool,
+    /// Ask before q quits, as `confirm_quit = true` in the config file does
+    #[arg(long, overrides_with = "no_confirm_quit")]
+    confirm_quit: bool,
+    /// Let q quit at once, whatever the config file says
+    #[arg(long, overrides_with = "confirm_quit")]
+    no_confirm_quit: bool,
     /// Seconds between reloads
     #[arg(short, long, value_name = "SECONDS", default_value_t = 60,
           value_parser = clap::value_parser!(u64).range(1..))]
@@ -163,8 +169,9 @@ fn main() -> ExitCode {
         filter,
         group: args.group,
         interval: Duration::from_secs(args.interval),
-        notify: !args.no_notify && (args.notify || config.notify),
-        writes: !args.no_writes && (args.writes || config.writes),
+        notify: !args.no_notify && (args.notify || config.settings.notify),
+        writes: !args.no_writes && (args.writes || config.settings.writes),
+        confirm_quit: !args.no_confirm_quit && (args.confirm_quit || config.settings.confirm_quit),
     };
     match app::run(options, config.sources, config.origin, seen) {
         Ok(()) => ExitCode::SUCCESS,

@@ -252,10 +252,18 @@ pub enum Change {
 pub struct Config {
     pub sources: Vec<Source>,
     pub origin: Origin,
+    pub settings: Settings,
+}
+
+/// The settings the config file can turn on; all are off without it.
+#[derive(Debug, Default)]
+pub struct Settings {
     /// Send desktop notifications; `notify = true` in the file
     pub notify: bool,
     /// Allow changes on the hosts, such as review requests; `writes = true` in the file
     pub writes: bool,
+    /// Ask before `q` quits; `confirm_quit = true` in the file
+    pub confirm_quit: bool,
 }
 
 #[derive(Deserialize)]
@@ -265,6 +273,8 @@ struct File {
     notify: bool,
     #[serde(default)]
     writes: bool,
+    #[serde(default)]
+    confirm_quit: bool,
     #[serde(default)]
     source: Vec<Entry>,
 }
@@ -337,11 +347,10 @@ pub fn path() -> Option<PathBuf> {
 /// The sources to load, and the settings. The flags replace the config file, and with
 /// neither, it searches github.com for `involves:@me`.
 pub fn load(github: &[String], forgejo: &[String]) -> Result<Config> {
-    let config = |sources, origin, (notify, writes)| Config {
+    let config = |sources, origin, settings| Config {
         sources,
         origin,
-        notify,
-        writes,
+        settings,
     };
     if !github.is_empty() || !forgejo.is_empty() {
         let github = github.iter().map(|q| Source::github(q, None, None));
@@ -349,22 +358,26 @@ pub fn load(github: &[String], forgejo: &[String]) -> Result<Config> {
         return Ok(config(
             github.chain(forgejo).collect(),
             Origin::Flags,
-            (false, false),
+            Settings::default(),
         ));
     }
     let default = || vec![Source::github(DEFAULT_QUERY, None, None)];
     let Some(path) = path() else {
-        return Ok(config(default(), Origin::Nowhere, (false, false)));
+        return Ok(config(default(), Origin::Nowhere, Settings::default()));
     };
     match fs::read_to_string(&path) {
         Ok(text) => {
             let file = read(&text).with_context(|| format!("{}", path.display()))?;
-            let settings = (file.notify, file.writes);
+            let settings = Settings {
+                notify: file.notify,
+                writes: file.writes,
+                confirm_quit: file.confirm_quit,
+            };
             let sources = sources(file).with_context(|| format!("{}", path.display()))?;
             Ok(config(sources, Origin::File(path), settings))
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {
-            Ok(config(default(), Origin::File(path), (false, false)))
+            Ok(config(default(), Origin::File(path), Settings::default()))
         }
         Err(e) => Err(e).with_context(|| format!("could not read {}", path.display())),
     }
@@ -740,8 +753,19 @@ mod tests {
             ]
         );
         assert_eq!(config.origin, Origin::Flags);
-        assert!(!config.notify);
-        assert!(!config.writes);
+        assert!(!config.settings.notify);
+        assert!(!config.settings.writes);
+        assert!(!config.settings.confirm_quit);
+    }
+
+    #[test]
+    fn confirm_quit_is_off_unless_the_file_turns_it_on() {
+        assert!(!read(FILE).unwrap().confirm_quit);
+        let text = format!("confirm_quit = true\n{FILE}");
+        assert!(read(&text).unwrap().confirm_quit);
+        assert_eq!(parse(&text).unwrap(), parse(FILE).unwrap());
+        let wrong = format!("confirm_quit = \"yes\"\n{FILE}");
+        assert!(read(&wrong).is_err());
     }
 
     #[test]

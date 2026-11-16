@@ -200,7 +200,7 @@ const HELP: [(&str, &str); 23] = [
     ("↑ ↓ PgUp PgDn Home End", "Move the cursor"),
     ("← →", "Scroll the columns; the first two stay"),
     ("?", "Show this help"),
-    ("q, ctrl+c", "Quit"),
+    ("q, ctrl+c", "Quit; with confirm_quit on, q asks first"),
 ];
 
 const NOTES_HELP: &str = "Notes: new, the PR changed since you last saw it; for you, it asks \
@@ -250,6 +250,8 @@ enum Mode {
     Form(Form),
     Preview(Box<View>),
     Reviewers(Box<Picker>),
+    /// Asking whether to quit, as `confirm_quit` is on
+    ConfirmQuit,
 }
 
 /// The preview of a PR, as it shows.
@@ -320,6 +322,8 @@ pub struct App {
     /// Allow changes on the hosts. Only the config file and --writes turn it on, so a key
     /// pressed by mistake can't
     writes: bool,
+    /// Ask before q quits
+    confirm_quit: bool,
     /// Where the form puts tokens; the tests use one in memory
     keychain: Arc<dyn Keychain>,
     /// Opens a page in the browser; the tests replace it, so they don't start one
@@ -334,6 +338,8 @@ pub struct Options {
     pub notify: bool,
     /// Allow changes on the hosts, such as review requests
     pub writes: bool,
+    /// Ask before q quits
+    pub confirm_quit: bool,
 }
 
 pub fn run(options: Options, sources: Vec<Source>, origin: Origin, seen: Seen) -> Result<()> {
@@ -418,6 +424,7 @@ impl App {
             // Without tea, the form shows no hint
             logins: || sources::tea_logins().unwrap_or_default(),
             writes: options.writes,
+            confirm_quit: options.confirm_quit,
             keychain: Arc::new(token::Os),
             browse: desktop::browse,
         }
@@ -746,12 +753,23 @@ impl App {
             Mode::Reviewers(picker) => self.on_reviewers_key(picker, key),
             // Any key closes the help
             Mode::Help => {}
+            Mode::ConfirmQuit => self.on_confirm_quit_key(key),
+        }
+    }
+
+    /// A second q does nothing, so holding q can't accidentally quit.
+    fn on_confirm_quit_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') => self.quit = true,
+            KeyCode::Esc | KeyCode::Char('n') => {}
+            _ => self.mode = Mode::ConfirmQuit,
         }
     }
 
     fn on_table_key(&mut self, key: KeyEvent) {
         let page = usize::from(self.table_area.height.saturating_sub(1)).max(1);
         match key.code {
+            KeyCode::Char('q') if self.confirm_quit => self.mode = Mode::ConfirmQuit,
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Enter | KeyCode::Char('o') => self.open_pr(),
             KeyCode::Char('p') => self.preview(),
@@ -1299,6 +1317,7 @@ impl App {
             Mode::Search => {}
             Mode::Preview(_) => self.draw_preview(frame, body),
             Mode::Reviewers(picker) => picker.draw(frame, body),
+            Mode::ConfirmQuit => draw_confirm_quit(frame, body),
         }
         self.draw_toasts(frame, body);
     }
@@ -1600,6 +1619,26 @@ fn footer_keys(width: u16) -> Line<'static> {
     manage::keys(&shown)
 }
 
+/// The question `confirm_quit` asks before q quits.
+fn draw_confirm_quit(frame: &mut Frame, area: Rect) {
+    let lines = vec![
+        Line::raw("Are you sure you want to quit?"),
+        Line::raw(""),
+        manage::keys(&[("enter", "Quit"), ("esc", "Cancel")]),
+    ];
+    let width = lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 4;
+    let rect = manage::popup(area, width, lines.len() as u16 + 2);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines).centered().block(
+            Block::bordered()
+                .title(" Quit ".bold())
+                .padding(Padding::horizontal(1)),
+        ),
+        rect,
+    );
+}
+
 fn draw_help(frame: &mut Frame, area: Rect) {
     let key_width = HELP
         .iter()
@@ -1800,6 +1839,7 @@ mod tests {
             interval: Duration::from_secs(60),
             notify: false,
             writes: false,
+            confirm_quit: false,
         };
         let mut app = App::new(options, sources, Origin::Flags, Seen::memory(), tx);
         app.load = |_| Ok(Vec::new());
@@ -2616,6 +2656,45 @@ mod tests {
         app.group = Group::Repo;
         app.show();
         assert_eq!(app.max_scroll(), 7);
+    }
+
+    #[test]
+    fn confirm_quit_asks_before_q_quits() {
+        let confirming = |on| {
+            let (mut app, rx) = app(Group::Repo, vec![github()]);
+            app.confirm_quit = on;
+            app.on_key(key(KeyCode::Char('q')));
+            (app, rx)
+        };
+        // Off, q quits at once
+        assert!(confirming(false).0.quit);
+
+        let (mut app, _rx) = confirming(true);
+        assert!(!app.quit);
+        let lines = screen(&mut app, 100, 12);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Are you sure you want to quit?"))
+        );
+        // Another q, as from a held key, and other keys do nothing
+        for c in "qqqx".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        assert!(!app.quit);
+        assert!(matches!(app.mode, Mode::ConfirmQuit));
+        // esc and n cancel
+        for code in [KeyCode::Esc, KeyCode::Char('n')] {
+            app.on_key(key(code));
+            assert!(matches!(app.mode, Mode::Table), "{code:?} didn't cancel");
+            app.on_key(key(KeyCode::Char('q')));
+        }
+        // enter and y quit
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.quit);
+        let (mut app, _rx) = confirming(true);
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(app.quit);
     }
 
     #[test]

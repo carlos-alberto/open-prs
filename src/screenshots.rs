@@ -39,6 +39,7 @@ fn demo() -> App {
         interval: Duration::from_secs(60),
         notify: false,
         writes: false,
+        confirm_quit: false,
     };
     let mut app = App::new(options, sources, Origin::File(config), Seen::memory(), tx);
     app.load = |_| Ok(Vec::new());
