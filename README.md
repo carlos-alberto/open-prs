@@ -47,6 +47,7 @@ This puts `open_prs` in `~/.cargo/bin`. Each source needs one of these:
 open_prs [-m/--mine] [-a/--approved | -n/--needs-review] [-w/--for-you] [-u/--new]
          [-f/--failing] [-d/--hide-drafts] [--text WORDS] [-g/--group repo|user]
          [-i/--interval SECONDS] [--notify | --no-notify] [--writes | --no-writes]
+         [--confirm-quit | --no-confirm-quit]
          [--github QUERY]... [--forgejo LOGIN]...
 ```
 
@@ -78,7 +79,7 @@ while it runs, and `/` changes the words. It reloads every SECONDS (default 60).
 | `↑` `↓` `PgUp` `PgDn` `Home` `End`, scroll | Move the cursor |
 | `←` `→`, sideways scroll | Scroll the columns; Repo and # stay |
 | `?` | Show every key |
-| `q`, `ctrl+c` | Quit |
+| `q`, `ctrl+c` | Quit; with `confirm_quit` on, `q` asks first: `enter` or `y` quits, `esc` or `n` cancels, and `ctrl+c` still quits at once |
 
 The footer shows as many keys as fit, and `?` shows them all.
 
@@ -199,6 +200,7 @@ GitHub sources exclude PRs in archived repositories.
 ```toml
 notify = true                  # desktop notifications; b sets it; default false
 writes = true                  # let v change the reviewers on the host; default false
+confirm_quit = true            # ask before q quits; default false
 
 [[source]]
 kind = "github"
