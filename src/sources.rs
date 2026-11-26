@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::config::{Kind, Login, Source};
 use crate::http::{Client, Http, Refused};
-use crate::pr::{Ci, Pr, Status};
+use crate::pr::{Ci, Lines, Pr, Status};
 use crate::preview::{self, Check, Comment, FileChange, Files, Preview};
 use crate::reviewers::{self as review, Reviewers};
 use crate::token;
@@ -439,6 +439,7 @@ query($q: String!, $endCursor: String) {
     pageInfo { hasNextPage endCursor }
     nodes { ... on PullRequest {
       number title url reviewDecision updatedAt isDraft mergeable baseRefName headRefName headRefOid
+      additions deletions
       author { login }
       repository { nameWithOwner }
       headRepository { nameWithOwner }
@@ -513,6 +514,8 @@ struct GhPr {
     comments: GhCount,
     /// Each holds inline comments on the code
     review_threads: GhThreads,
+    additions: u64,
+    deletions: u64,
 }
 
 #[derive(Deserialize)]
@@ -800,6 +803,10 @@ fn parse_github(name: &str, out: &str) -> Result<Vec<Pr>> {
                         .iter()
                         .map(|t| t.comments.total_count)
                         .sum::<u64>(),
+                lines: Some(Lines {
+                    added: n.additions,
+                    deleted: n.deletions,
+                }),
                 base: n.base_ref_name,
                 head,
                 parent: None,
@@ -1517,6 +1524,8 @@ fn forgejo(name: &str, login: &str, owner: Option<&str>) -> Result<Vec<Pr>> {
             draft,
             conflict: pull.mergeable == Some(false) && !draft,
             comments: 0,
+            // tea doesn't give them
+            lines: None,
             base: String::new(),
             head: String::new(),
             parent: None,
@@ -1864,6 +1873,10 @@ fn forgejo_api(name: &str, http: &dyn Http, owner: Option<&str>) -> Result<Vec<P
             draft,
             conflict: !pull.mergeable && !draft,
             comments: pull.comments,
+            lines: Some(Lines {
+                added: pull.additions,
+                deleted: pull.deletions,
+            }),
             base: pull.base.name,
             head: if pull.head.repo_id == pull.base.repo_id {
                 pull.head.name
@@ -2304,7 +2317,7 @@ mod tests {
                 _ => "",
             };
             format!(
-                r#"{{"number":{number},"title":"t","url":"u{number}","reviewDecision":{decision},"updatedAt":"2026-11-04T09:07:15Z","isDraft":{draft},"mergeable":"{mergeable}","baseRefName":"main","headRefName":"b{number}","author":{author},"repository":{{"nameWithOwner":"acme/r"}},"headRepository":{head_repo},"latestOpinionatedReviews":{{"nodes":[{reviews}]}},"commits":{{"nodes":[{commits}]}},"comments":{{"totalCount":{talk}}},"reviewThreads":{{"nodes":[{threads}]}}}}"#
+                r#"{{"number":{number},"title":"t","url":"u{number}","reviewDecision":{decision},"updatedAt":"2026-11-04T09:07:15Z","isDraft":{draft},"mergeable":"{mergeable}","baseRefName":"main","headRefName":"b{number}","additions":{number}0,"deletions":{number},"author":{author},"repository":{{"nameWithOwner":"acme/r"}},"headRepository":{head_repo},"latestOpinionatedReviews":{{"nodes":[{reviews}]}},"commits":{{"nodes":[{commits}]}},"comments":{{"totalCount":{talk}}},"reviewThreads":{{"nodes":[{threads}]}}}}"#
             )
         };
         let out = format!(
@@ -2356,6 +2369,11 @@ mod tests {
         assert_eq!(prs[0].checks_url, "u1/checks");
         let comments: Vec<_> = prs.iter().map(|p| p.comments).collect();
         assert_eq!(comments, [2, 0, 3]);
+        let lines: Vec<_> = prs
+            .iter()
+            .map(|p| p.lines.map(|l| (l.added, l.deleted)))
+            .collect();
+        assert_eq!(lines, [Some((10, 1)), Some((20, 2)), Some((30, 3))]);
         let branches: Vec<_> = prs
             .iter()
             .map(|p| (p.base.as_str(), p.head.as_str()))
@@ -2504,7 +2522,7 @@ mod tests {
     /// A PR in GitHub's search, with only what parse_github needs.
     fn gh_node(number: u64) -> String {
         format!(
-            r#"{{"number":{number},"title":"t","url":"u{number}","reviewDecision":null,"updatedAt":"2026-11-04T09:07:15Z","isDraft":false,"mergeable":"MERGEABLE","baseRefName":"main","headRefName":"b{number}","headRefOid":"sha{number}","author":{{"login":"me"}},"repository":{{"nameWithOwner":"acme/r"}},"headRepository":{{"nameWithOwner":"acme/r"}},"latestOpinionatedReviews":{{"nodes":[]}},"commits":{{"nodes":[]}},"comments":{{"totalCount":0}},"reviewThreads":{{"nodes":[]}}}}"#
+            r#"{{"number":{number},"title":"t","url":"u{number}","reviewDecision":null,"updatedAt":"2026-11-04T09:07:15Z","isDraft":false,"mergeable":"MERGEABLE","baseRefName":"main","headRefName":"b{number}","headRefOid":"sha{number}","additions":0,"deletions":0,"author":{{"login":"me"}},"repository":{{"nameWithOwner":"acme/r"}},"headRepository":{{"nameWithOwner":"acme/r"}},"latestOpinionatedReviews":{{"nodes":[]}},"commits":{{"nodes":[]}},"comments":{{"totalCount":0}},"reviewThreads":{{"nodes":[]}}}}"#
         )
     }
 
