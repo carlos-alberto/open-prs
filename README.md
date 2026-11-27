@@ -95,6 +95,9 @@ is blank for none. GitHub counts the comments in the conversation and the inline
 the code. Forgejo counts each comment in the conversation and each review, also an approval
 with no text, but not the inline comments.
 
+The +/- column has the lines the PR adds, in green, and deletes, in red. It is blank for
+sources that use tea's login, as tea doesn't give them.
+
 The Host column shows only when the PRs come from more than one host. The table leaves out
 the owner when every PR has the same one. When two sources find the same PR, it shows once,
 from the first source.

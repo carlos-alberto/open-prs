@@ -98,6 +98,7 @@ enum Col {
     Notes,
     Author,
     Comments,
+    Lines,
     Updated,
     Title,
 }
@@ -115,6 +116,7 @@ impl Col {
             Col::Notes => "Notes",
             Col::Author => "Author",
             Col::Comments => "Comments",
+            Col::Lines => "+/-",
             Col::Updated => "Updated",
             Col::Title => "Title",
         }
@@ -135,6 +137,7 @@ impl Fit {
             // Grouped by user, the author is the group
             (by_repo, Col::Author),
             (true, Col::Comments),
+            (true, Col::Lines),
             (true, Col::Updated),
             (true, Col::Title),
         ]
@@ -1467,16 +1470,32 @@ impl App {
             .into_iter()
             .chain(scrolling[scroll..].iter().copied())
             .collect();
+        let signed_number_width = self
+            .rows
+            .iter()
+            .filter_map(|p| p.lines)
+            .map(|l| 1 + digits(l.added).max(digits(l.deleted)))
+            .max()
+            .unwrap_or(0);
+        let mut lines_pad = (0, 0);
         let headers: Vec<String> = cols
             .iter()
             .enumerate()
             .map(|(i, c)| {
                 // ‹ says columns are hidden to the left
-                if i == FROZEN.len() && scroll > 0 {
+                let header = if i == FROZEN.len() && scroll > 0 {
                     format!("‹ {}", c.header(by_repo))
                 } else {
                     c.header(by_repo).to_owned()
+                };
+                if *c != Col::Lines {
+                    return header;
                 }
+                // Where the / in the header is so we can put the space between the +/- numbers
+                let slash = header.chars().count() - 2;
+                let at = slash.max(signed_number_width);
+                lines_pad = (at - slash, at - signed_number_width);
+                format!("{}{header}", " ".repeat(lines_pad.0))
             })
             .collect();
 
@@ -1538,6 +1557,18 @@ impl App {
                         0 => Line::default(),
                         n => Line::raw(n.to_string()).right_aligned(),
                     },
+                    // Blank when the host doesn't say, as with tea
+                    Col::Lines => p.lines.map_or_else(Line::default, |l| {
+                        let added = format!("{:>signed_number_width$}", format!("+{}", l.added));
+                        let deleted =
+                            format!("{:<signed_number_width$}", format!("-{}", l.deleted));
+                        Line::from(vec![
+                            Span::raw(" ".repeat(lines_pad.1)),
+                            Span::styled(added, Style::new().fg(Color::Green)),
+                            Span::raw(" "),
+                            Span::styled(deleted, Style::new().fg(Color::Red)),
+                        ])
+                    }),
                     Col::Updated => Line::raw(age(p.updated, now)),
                     // Like an unread email
                     Col::Title if p.new => Line::raw(p.title.clone()).bold(),
@@ -1723,6 +1754,11 @@ fn web_parts(url: &str, what: &str) -> Result<(String, String), String> {
     Ok((scheme, host.to_ascii_lowercase()))
 }
 
+/// How many digits `n` has.
+fn digits(n: u64) -> usize {
+    n.checked_ilog10().map_or(1, |d| d as usize + 1)
+}
+
 /// `path` with the home folder as `~`.
 fn tilde(path: &str) -> String {
     match std::env::home_dir().map(|h| h.display().to_string()) {
@@ -1821,8 +1857,8 @@ fn base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pr::Ci;
     use crate::pr::tests::pr;
+    use crate::pr::{Ci, Lines};
 
     fn github() -> Source {
         Source::github("org:acme", None, None)
@@ -2485,6 +2521,14 @@ mod tests {
         app.feeds[0].prs[1].ci = Some(Ci::Passed);
         app.feeds[0].prs[2].draft = true;
         app.feeds[0].prs[0].comments = 12;
+        app.feeds[0].prs[0].lines = Some(Lines {
+            added: 120,
+            deleted: 34,
+        });
+        app.feeds[0].prs[1].lines = Some(Lines {
+            added: 5,
+            deleted: 0,
+        });
         app.show();
         app.notify(
             "GitHub failed".into(),
@@ -2513,12 +2557,17 @@ mod tests {
             lines[4]
                 .starts_with("web      #1207  changes requested           draft             zed")
         );
-        // Comments are right-aligned under their 8-wide header, and blank for none
-        assert!(lines[1].contains("Author  Comments  Updated"));
+        // Comments are right-aligned under their 8-wide header, and blank for none. The lines
+        // have the space between them under the /, and are blank when the host doesn't say
+        assert!(lines[1].contains("Author  Comments     +/-     Updated"));
         // The PRs are from 1970, so their age grows each week
         let weeks = age(Timestamp::UNIX_EPOCH, Timestamp::now());
-        assert!(lines[2].contains(&format!("amy{}12  {weeks}", " ".repeat(11))));
-        assert!(lines[3].contains(&format!("me{}{weeks}", " ".repeat(16))));
+        assert!(lines[2].contains(&format!("amy{}12  +120 -34   {weeks}", " ".repeat(11))));
+        assert!(lines[3].contains(&format!("me{}  +5 -0    {weeks}", " ".repeat(16))));
+        assert!(lines[4].contains(&format!("zed{}{weeks}", " ".repeat(26))));
+        let slash = lines[1].find("+/-").unwrap() + 1;
+        assert_eq!(lines[2].find("+120 ").unwrap() + 4, slash);
+        assert_eq!(lines[3].find("+5 ").unwrap() + 2, slash);
         assert!(lines.iter().any(|l| l.contains(" GitHub failed ")));
         assert!(lines[11].starts_with(" o  Open"));
         assert!(lines[11].contains(" p  Preview"));
@@ -2619,7 +2668,7 @@ mod tests {
         // Narrow: one space between columns, and the short status, but every column stays
         let narrow = screen(&mut app, 80, 6);
         assert!(narrow[1].starts_with(
-            "Repo    #     Status  CI     Notes Author         Comments Updated Title"
+            "Repo    #     Status  CI     Notes Author         Comments +/- Updated Title"
         ));
         assert!(narrow[2].contains("changes "));
         assert!(!narrow[2].contains("changes requested"));
@@ -2635,7 +2684,7 @@ mod tests {
         for _ in 0..20 {
             app.on_key(key(KeyCode::Right));
         }
-        assert_eq!(app.scroll, 6);
+        assert_eq!(app.scroll, 7);
         let lines = screen(&mut app, 80, 6);
         assert!(lines[1].starts_with("Repo     #      ‹ Title"));
         assert!(lines[2].contains("Show the new invoice page to the beta testers"));
@@ -2648,16 +2697,42 @@ mod tests {
     }
 
     #[test]
+    fn scrolled_to_the_lines_their_space_stays_under_the_slash() {
+        let (mut app, _rx) = app(Group::Repo, vec![github()]);
+        let mut p = pr("GitHub", "billing", 4012, "amy", Status::Needs);
+        p.lines = Some(Lines {
+            added: 7,
+            deleted: 1500,
+        });
+        app.feeds[0].prs = vec![p];
+        app.show();
+        // Status, CI, Notes, Author and Comments hide, so the header is ‹ +/-
+        for _ in 0..5 {
+            app.on_key(key(KeyCode::Right));
+        }
+        let lines = screen(&mut app, 100, 6);
+        // In columns, as ‹ is more than one byte
+        let col = |line: &str, text| line[..line.find(text).unwrap()].chars().count();
+        assert_eq!(col(&lines[2], " -1500"), col(&lines[1], "‹ +/-") + 3);
+        assert!(lines[2].contains("   +7 -1500"));
+    }
+
+    #[test]
+    fn digits_counts_zero_as_one() {
+        assert_eq!([0, 9, 10, 99_999, 100_000].map(digits), [1, 1, 2, 5, 6]);
+    }
+
+    #[test]
     fn grouped_by_user_there_is_no_author_column_to_scroll() {
         let (mut app, _rx) = app(Group::User, vec![github(), forgejo()]);
         app.feeds[0].prs = vec![pr("GitHub", "a", 1, "x", Status::Needs)];
         app.feeds[1].prs = vec![pr("Forgejo", "a", 1, "x", Status::Needs)];
         app.show();
-        // Host, Status, CI, Notes, Comments, Updated hide; the title stays
-        assert_eq!(app.max_scroll(), 6);
+        // Host, Status, CI, Notes, Comments, +/-, Updated hide; the title stays
+        assert_eq!(app.max_scroll(), 7);
         app.group = Group::Repo;
         app.show();
-        assert_eq!(app.max_scroll(), 7);
+        assert_eq!(app.max_scroll(), 8);
     }
 
     #[test]

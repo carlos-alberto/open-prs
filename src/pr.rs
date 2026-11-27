@@ -120,6 +120,13 @@ impl Group {
     }
 }
 
+/// The lines a PR adds and deletes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lines {
+    pub added: u64,
+    pub deleted: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Pr {
     /// The name of the source that found it
@@ -145,6 +152,8 @@ pub struct Pr {
     pub conflict: bool,
     /// What the host counts as comments; see the README
     pub comments: u64,
+    /// The lines it adds and deletes, or None when the host doesn't say
+    pub lines: Option<Lines>,
     /// The branch it merges into
     pub base: String,
     /// Its branch, or empty when that is in another repo, as then nothing here can stack on it
@@ -407,6 +416,7 @@ pub mod tests {
             draft: false,
             conflict: false,
             comments: 0,
+            lines: None,
             base: "main".into(),
             head: format!("branch-{number}"),
             parent: None,
