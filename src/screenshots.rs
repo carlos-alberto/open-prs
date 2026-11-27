@@ -5,7 +5,9 @@
 use std::fmt::Write as _;
 use std::fs;
 
-use chrono::{Duration as Ago, Local, TimeZone};
+use jiff::SignedDuration;
+use jiff::civil::date;
+use jiff::tz::TimeZone;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -43,13 +45,13 @@ fn demo() -> App {
     };
     let mut app = App::new(options, sources, Origin::File(config), Seen::memory(), tx);
     app.load = |_| Ok(Vec::new());
-    app.load_preview = |_, _| Ok(preview(Utc::now()));
+    app.load_preview = |_, _| Ok(preview(Timestamp::now()));
     app.load_reviewers = |_, _, _| Ok(Reviewers::default());
     app.save_reviewers = |_, _, _| Ok(());
     app.logins = || vec!["work".into()];
     app.keychain = Arc::new(token::tests::Fake::default());
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let make = |host: &str, repo: &str, number: u64, author: &str, status: Status, title: &str| {
         let mut p = pr(host, repo, number, author, status);
         p.title = title.into();
@@ -145,7 +147,7 @@ fn demo() -> App {
     for (p, (ci, comments, minutes, for_you, conflict)) in github.iter_mut().zip(details) {
         p.ci = ci;
         p.comments = comments;
-        p.updated = now - Ago::minutes(minutes);
+        p.updated = now - SignedDuration::from_mins(minutes);
         p.requested = for_you;
         p.conflict = conflict;
     }
@@ -169,10 +171,10 @@ fn demo() -> App {
     ];
     forgejo[0].draft = true;
     forgejo[0].comments = 2;
-    forgejo[0].updated = now - Ago::days(9);
+    forgejo[0].updated = now - SignedDuration::from_hours(9 * 24);
     forgejo[1].ci = Some(Ci::Passed);
     forgejo[1].comments = 1;
-    forgejo[1].updated = now - Ago::hours(20);
+    forgejo[1].updated = now - SignedDuration::from_hours(20);
     for p in &mut forgejo {
         p.url = p.url.replace("/pull/", "/pulls/");
     }
@@ -187,7 +189,10 @@ fn demo() -> App {
     }
     app.feeds[2].state =
         State::Failed("HTTP 401: Bad credentials (https://ghe.acme.dev/api/graphql)".into());
-    app.updated = Local.with_ymd_and_hms(2026, 11, 4, 9, 41, 27).single();
+    app.updated = date(2026, 11, 4)
+        .at(9, 41, 27, 0)
+        .to_zoned_datetime(TimeZone::system())
+        .ok();
     app.follow = true;
     app.show();
     app.table.select(Some(1));
@@ -216,7 +221,7 @@ fn screenshots() {
     // api #418, with what the host says about it, as if it loaded
     app.on_key(key('p'));
     if let Mode::Preview(view) = &mut app.mode {
-        view.content = Some(Ok(preview(Utc::now())));
+        view.content = Some(Ok(preview(Timestamp::now())));
         view.loading = false;
     }
     save("preview", &mut app, 100, 30);
@@ -250,10 +255,10 @@ fn screenshots() {
 }
 
 /// What the host says about api #418.
-fn preview(now: DateTime<Utc>) -> Preview {
+fn preview(now: Timestamp) -> Preview {
     let comment = |author: &str, minutes, body: &str, verdict| Comment {
         author: author.into(),
-        when: now - Ago::minutes(minutes),
+        when: now - SignedDuration::from_mins(minutes),
         body: body.into(),
         verdict,
     };

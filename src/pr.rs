@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use ratatui::style::{Color, Style};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,7 +135,7 @@ pub struct Pr {
     pub ci: Option<Ci>,
     /// The page with the PR's CI runs
     pub checks_url: String,
-    pub updated: DateTime<Utc>,
+    pub updated: Timestamp,
     pub mine: bool,
     /// It asks for your review
     pub requested: bool,
@@ -367,8 +367,8 @@ fn walk(
     }
 }
 
-pub fn age(t: DateTime<Utc>, now: DateTime<Utc>) -> String {
-    let seconds = (now - t).num_seconds();
+pub fn age(t: Timestamp, now: Timestamp) -> String {
+    let seconds = now.duration_since(t).as_secs();
     for (unit, size) in [("w", 604800), ("d", 86400), ("h", 3600), ("m", 60)] {
         if seconds >= size {
             return format!("{}{unit}", seconds / size);
@@ -380,6 +380,7 @@ pub fn age(t: DateTime<Utc>, now: DateTime<Utc>) -> String {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use jiff::SignedDuration;
 
     /// A PR in `repo`, which is `owner/name` or a name in the `acme` org.
     pub fn pr(host: &str, repo: &str, number: u64, author: &str, status: Status) -> Pr {
@@ -399,7 +400,7 @@ pub mod tests {
             author: author.into(),
             status,
             ci: None,
-            updated: DateTime::UNIX_EPOCH,
+            updated: Timestamp::UNIX_EPOCH,
             mine: author == "me",
             requested: false,
             new: false,
@@ -706,8 +707,8 @@ pub mod tests {
 
     #[test]
     fn age_uses_the_largest_whole_unit() {
-        let now = DateTime::UNIX_EPOCH + chrono::Duration::weeks(10);
-        let ago = |s| age(now - chrono::Duration::seconds(s), now);
+        let now = Timestamp::UNIX_EPOCH + SignedDuration::from_hours(10 * 7 * 24);
+        let ago = |s| age(now - SignedDuration::from_secs(s), now);
         assert_eq!(ago(0), "now");
         assert_eq!(ago(59), "now");
         assert_eq!(ago(60), "1m");

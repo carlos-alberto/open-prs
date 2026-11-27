@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -497,7 +497,7 @@ struct GhPr {
     title: String,
     url: String,
     review_decision: Option<String>,
-    updated_at: DateTime<Utc>,
+    updated_at: Timestamp,
     is_draft: bool,
     /// MERGEABLE, CONFLICTING, or UNKNOWN while GitHub works it out
     mergeable: String,
@@ -867,7 +867,7 @@ struct GhFile {
 struct GhComment {
     author: Option<GhLogin>,
     body: String,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
 }
 
 #[derive(Deserialize)]
@@ -877,7 +877,7 @@ struct GhReview {
     state: String,
     body: String,
     /// null while it is pending
-    submitted_at: Option<DateTime<Utc>>,
+    submitted_at: Option<Timestamp>,
 }
 
 #[derive(Deserialize)]
@@ -1277,7 +1277,7 @@ struct TeaIssue {
     author_id: String,
     owner: String,
     repo: String,
-    updated: DateTime<Utc>,
+    updated: Timestamp,
 }
 
 #[derive(Deserialize, Default)]
@@ -1314,7 +1314,7 @@ struct TeaReview {
     #[serde(default)]
     body: String,
     #[serde(default)]
-    created: Option<DateTime<Utc>>,
+    created: Option<Timestamp>,
 }
 
 /// A PR on its own, with --comments.
@@ -1334,7 +1334,7 @@ struct TeaPullDetail {
 #[derive(Deserialize)]
 struct TeaComment {
     author: String,
-    created: DateTime<Utc>,
+    created: Timestamp,
     #[serde(default)]
     body: String,
 }
@@ -1668,7 +1668,7 @@ struct FjIssue {
     title: String,
     html_url: String,
     user: FjUser,
-    updated_at: DateTime<Utc>,
+    updated_at: Timestamp,
     repository: FjRepo,
 }
 
@@ -1717,7 +1717,7 @@ struct FjReview {
     state: String,
     #[serde(default)]
     body: String,
-    submitted_at: Option<DateTime<Utc>>,
+    submitted_at: Option<Timestamp>,
 }
 
 #[derive(Deserialize)]
@@ -1756,7 +1756,7 @@ struct FjComment {
     user: Option<FjUser>,
     #[serde(default)]
     body: String,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
 }
 
 /// GETs `path` and reads the reply as JSON.

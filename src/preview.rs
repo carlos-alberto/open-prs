@@ -1,6 +1,6 @@
 //! The preview of one PR: its description, checks, files and last comments.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 
@@ -44,7 +44,7 @@ pub struct Check {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Comment {
     pub author: String,
-    pub when: DateTime<Utc>,
+    pub when: Timestamp,
     pub body: String,
     /// For a review: approved, changes requested or reviewed
     pub verdict: Option<&'static str>,
@@ -68,7 +68,7 @@ pub fn lines(
     p: &Pr,
     content: Option<&Result<Preview, String>>,
     width: u16,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = wrap(&clean(&p.title), width)
         .into_iter()
@@ -172,7 +172,7 @@ pub fn lines(
 }
 
 /// Who opened it, its status, CI and notes, and when it changed.
-fn about(p: &Pr, now: DateTime<Utc>) -> Line<'static> {
+fn about(p: &Pr, now: Timestamp) -> Line<'static> {
     let gap = || Span::raw(" · ");
     let mut spans = vec![
         Span::raw(clean(&p.author)),
@@ -274,7 +274,7 @@ mod tests {
     use super::*;
     use crate::pr::Status;
     use crate::pr::tests::pr;
-    use chrono::TimeDelta;
+    use jiff::SignedDuration;
 
     fn text(lines: &[Line]) -> Vec<String> {
         lines
@@ -286,7 +286,7 @@ mod tests {
     fn comment(author: &str, minutes: i64, body: &str, verdict: Option<&'static str>) -> Comment {
         Comment {
             author: author.into(),
-            when: DateTime::UNIX_EPOCH + TimeDelta::minutes(minutes),
+            when: Timestamp::UNIX_EPOCH + SignedDuration::from_mins(minutes),
             body: body.into(),
             verdict,
         }
@@ -342,7 +342,7 @@ mod tests {
                 comment("chidi", 5, "", Some("changes requested")),
             ],
         };
-        let now = DateTime::UNIX_EPOCH + TimeDelta::hours(2);
+        let now = Timestamp::UNIX_EPOCH + SignedDuration::from_hours(2);
         let lines = text(&lines(&p, Some(&Ok(preview)), 60, now));
         assert_eq!(
             lines,
@@ -373,7 +373,7 @@ mod tests {
     #[test]
     fn lines_say_when_it_loads_or_fails() {
         let p = pr("Forgejo", "docs", 23, "dana", Status::Needs);
-        let now = DateTime::UNIX_EPOCH;
+        let now = Timestamp::UNIX_EPOCH;
         assert_eq!(text(&lines(&p, None, 60, now)).last().unwrap(), "Loading…");
         let failed = Err("HTTP 404".to_owned());
         assert_eq!(
