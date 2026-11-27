@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use chrono::{DateTime, Local, Utc};
+use jiff::{Timestamp, ZonedDateTime};
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -285,7 +285,7 @@ pub struct App {
     next_id: u64,
     origin: Origin,
     mode: Mode,
-    updated: Option<DateTime<Local>>,
+    updated: Option<ZonedDateTime>,
     /// False until every source first loads; see `show`
     follow: bool,
     /// The PRs on screen, in order
@@ -520,7 +520,7 @@ impl App {
         }
         let done = !self.loading();
         if done {
-            self.updated = Some(Local::now());
+            self.updated = Some(ZonedDateTime::now());
         }
         if started {
             self.save_seen();
@@ -640,7 +640,9 @@ impl App {
             .flat_map(|f| &f.prs)
             .map(|p| p.url.as_str())
             .collect();
-        let result = self.seen.save(all_loaded.then_some(&open), Utc::now());
+        let result = self
+            .seen
+            .save(all_loaded.then_some(&open), Timestamp::now());
         match result {
             Ok(()) => self.seen_failed = false,
             Err(e) if !self.seen_failed => {
@@ -1258,10 +1260,10 @@ impl App {
         if !loading.is_empty() {
             loading.sort();
             parts.push(format!("loading {}…", loading.join(" and ")));
-        } else if let Some(updated) = self.updated {
+        } else if let Some(updated) = &self.updated {
             parts.push(format!(
                 "updated {}, every {}s",
-                updated.format("%H:%M:%S"),
+                updated.strftime("%H:%M:%S"),
                 self.interval.as_secs()
             ));
         }
@@ -1283,7 +1285,7 @@ impl App {
         );
 
         self.table_area = body;
-        let table = self.table_widget(Utc::now(), body.width);
+        let table = self.table_widget(Timestamp::now(), body.width);
         frame.render_stateful_widget(table, body, &mut self.table);
         let footer_line = match &self.mode {
             Mode::Search => {
@@ -1331,7 +1333,7 @@ impl App {
         // Inside the borders and the padding
         let width = rect.width.saturating_sub(4).max(1);
         let height = usize::from(rect.height.saturating_sub(2));
-        let lines = preview::lines(&view.pr, view.content.as_ref(), width, Utc::now());
+        let lines = preview::lines(&view.pr, view.content.as_ref(), width, Timestamp::now());
         view.max_scroll = lines.len().saturating_sub(height);
         view.page = height.max(1);
         view.scroll = view.scroll.min(view.max_scroll);
@@ -1400,7 +1402,7 @@ impl App {
     }
 
     /// The table, with as much as fits in `width`; see `FIT_STEPS`.
-    fn table_widget(&self, now: DateTime<Utc>, width: u16) -> Table<'static> {
+    fn table_widget(&self, now: Timestamp, width: u16) -> Table<'static> {
         let layout = self.fit(now, width);
         let widths: Vec<Constraint> = layout
             .widths
@@ -1425,7 +1427,7 @@ impl App {
 
     /// Takes the steps in `FIT_STEPS` until the title has `TITLE_MIN` columns, or there are
     /// no more.
-    fn fit(&self, now: DateTime<Utc>, width: u16) -> TableLayout {
+    fn fit(&self, now: Timestamp, width: u16) -> TableLayout {
         let mut fit = self.fit_start();
         let mut layout = self.layout(&fit, now);
         for step in FIT_STEPS {
@@ -1456,7 +1458,7 @@ impl App {
         self.scroll = self.scroll.saturating_add_signed(by).min(self.max_scroll());
     }
 
-    fn layout(&self, fit: &Fit, now: DateTime<Utc>) -> TableLayout {
+    fn layout(&self, fit: &Fit, now: Timestamp) -> TableLayout {
         let by_repo = self.group == Group::Repo;
         let owner = self.owner.as_deref();
         let scrolling = fit.scrolling(by_repo);
@@ -1911,7 +1913,7 @@ mod tests {
 
         // A PR that opened since, and one that changed since
         let mut changed = first.clone();
-        changed.updated += chrono::TimeDelta::minutes(5);
+        changed.updated += jiff::SignedDuration::from_mins(5);
         let opened = pr("GitHub", "a", 2, "x", Status::Needs);
         app.loaded(0, Ok(vec![changed, opened]));
         let new: Vec<u64> = app
@@ -2514,7 +2516,7 @@ mod tests {
         // Comments are right-aligned under their 8-wide header, and blank for none
         assert!(lines[1].contains("Author  Comments  Updated"));
         // The PRs are from 1970, so their age grows each week
-        let weeks = age(DateTime::UNIX_EPOCH, Utc::now());
+        let weeks = age(Timestamp::UNIX_EPOCH, Timestamp::now());
         assert!(lines[2].contains(&format!("amy{}12  {weeks}", " ".repeat(11))));
         assert!(lines[3].contains(&format!("me{}{weeks}", " ".repeat(16))));
         assert!(lines.iter().any(|l| l.contains(" GitHub failed ")));

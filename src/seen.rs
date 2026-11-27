@@ -11,18 +11,18 @@ use std::io::ErrorKind;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, TimeDelta, Utc};
+use jiff::{SignedDuration, Timestamp};
 
 use crate::pr::Pr;
 
 /// How long it keeps a PR that no source found.
-const KEEP: TimeDelta = TimeDelta::days(30);
+const KEEP: SignedDuration = SignedDuration::from_hours(30 * 24);
 
 pub struct Seen {
     /// None keeps it in memory, as without a home folder
     path: Option<PathBuf>,
     /// Each PR's updated time when you last saw it, by URL
-    times: BTreeMap<String, DateTime<Utc>>,
+    times: BTreeMap<String, Timestamp>,
     /// The file is there, so it knows every PR it saw; a PR it doesn't know is new
     exists: bool,
 }
@@ -93,7 +93,7 @@ impl Seen {
     /// Makes `p` new again, as if you last saw it before its last change.
     pub fn unmark(&mut self, p: &Pr) {
         self.times
-            .insert(p.url.clone(), p.updated - TimeDelta::seconds(1));
+            .insert(p.url.clone(), p.updated - SignedDuration::from_secs(1));
     }
 
     /// Puts down the PRs it doesn't know as seen, for the first load of a source.
@@ -106,10 +106,11 @@ impl Seen {
     /// Writes the file. With `open`, the URLs of every open PR, it forgets the PRs that
     /// closed; leave it out when a source failed, as then its PRs are missing. It keeps a
     /// PR that changed in the last `KEEP`, which other sources, or other flags, can find.
-    pub fn save(&mut self, open: Option<&HashSet<&str>>, now: DateTime<Utc>) -> Result<()> {
+    pub fn save(&mut self, open: Option<&HashSet<&str>>, now: Timestamp) -> Result<()> {
         if let Some(open) = open {
-            self.times
-                .retain(|url, seen| open.contains(url.as_str()) || now - *seen < KEEP);
+            self.times.retain(|url, seen| {
+                open.contains(url.as_str()) || now.duration_since(*seen) < KEEP
+            });
         }
         // From here on, it knows every PR it saw
         self.exists = true;
@@ -134,8 +135,8 @@ mod tests {
     use crate::pr::Status;
     use crate::pr::tests::pr;
 
-    fn at(minutes: i64) -> DateTime<Utc> {
-        DateTime::UNIX_EPOCH + TimeDelta::minutes(minutes)
+    fn at(minutes: i64) -> Timestamp {
+        Timestamp::UNIX_EPOCH + SignedDuration::from_mins(minutes)
     }
 
     fn pr_at(number: u64, minutes: i64) -> Pr {
@@ -229,5 +230,14 @@ mod tests {
             error.contains("seen.json; delete it to start again"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn reads_the_times_that_chrono_wrote_and_hosts_send() {
+        // chrono wrote fractions of a second; Forgejo and Gitea send an offset
+        let text = r#"{"a": "2026-11-04T09:41:27.123456789Z", "b": "2026-11-04T10:41:27+01:00"}"#;
+        let times: BTreeMap<String, Timestamp> = serde_json::from_str(text).unwrap();
+        assert_eq!(times["a"].as_second(), times["b"].as_second());
+        assert_eq!(times["a"].subsec_nanosecond(), 123_456_789);
     }
 }

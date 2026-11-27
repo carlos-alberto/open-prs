@@ -5,7 +5,8 @@ use std::fmt;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Local};
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use serde_json::Value;
 use ureq::http::Response;
 use ureq::tls::{RootCerts, TlsConfig};
@@ -186,9 +187,9 @@ impl Client {
             if remaining.as_deref() == Some("0")
                 && let Some(at) = reset
                     .and_then(|r| r.parse().ok())
-                    .and_then(|r| DateTime::from_timestamp(r, 0))
+                    .and_then(|r| Timestamp::from_second(r).ok())
             {
-                let at = at.with_timezone(&Local).format("%H:%M");
+                let at = at.to_zoned_datetime(TimeZone::system()).strftime("%H:%M");
                 bail!("{host}'s rate limit; it resets at {at}");
             }
             if let Some(seconds) = retry {
@@ -416,10 +417,10 @@ mod tests {
     #[test]
     fn errors_say_what_to_do() {
         let reset = 4_102_444_800; // 2100-01-01
-        let at = DateTime::from_timestamp(reset, 0)
+        let at = Timestamp::from_second(reset)
             .unwrap()
-            .with_timezone(&Local)
-            .format("%H:%M");
+            .to_zoned_datetime(TimeZone::system())
+            .strftime("%H:%M");
         let cases = [
             (reply("401 Unauthorized", &[], r#"{"message":"Bad credentials"}"#), "/user", "the token for Work is wrong or expired".to_owned()),
             (
